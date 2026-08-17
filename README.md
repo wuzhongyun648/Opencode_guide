@@ -13,7 +13,7 @@
 | [01 OpenCode 安装与首次运行](./01_Installation.md) | 安装 CLI、Desktop 和 IDE Extension，完成首次启动 | 所有初次使用者 |
 | [02 OpenCode 模型配置与部署](./02_Model_Deployment.md) | 接入模型 API、订阅、自定义接口和本地模型 | 完成安装后配置模型 |
 | [03 OpenCode Server 部署](./03_OpenCode_Server_Deployment.md) | 本地监听、远程连接、Web、systemd 和 Docker 部署 | 远程开发、服务化和容器场景 |
-| [04 OpenCode 常用命令与基础工作流](./04_common_commands.md) | CLI、TUI 斜杠命令、快捷键和常见问题 | 日常使用 OpenCode |
+| [04 OpenCode 常用命令与基础工作流](./04_Useful_Commands.md) | CLI、TUI 斜杠命令、快捷键和常见问题 | 日常使用 OpenCode |
 | [05 OpenCode 增强功能](./05_Enhancement.md) | OpenCode 进阶能力与扩展配置 | 掌握基础操作后继续学习 |
 | [06 Harness](./06_Harness.md) | Harness 相关内容 | 需要进一步集成和自动化时 |
 
