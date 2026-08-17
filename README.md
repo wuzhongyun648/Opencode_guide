@@ -14,16 +14,10 @@
 | [02 OpenCode 模型配置与部署](./02_Model_Deployment.md) | 接入模型 API、订阅、自定义接口和本地模型 | 完成安装后配置模型 |
 | [03 OpenCode Server 部署](./03_OpenCode_Server_Deployment.md) | 本地监听、远程连接、Web、systemd 和 Docker 部署 | 远程开发、服务化和容器场景 |
 | [04 OpenCode 常用命令与基础工作流](./04_Useful_Commands.md) | CLI、TUI 斜杠命令、快捷键和常见问题 | 日常使用 OpenCode |
-| [05 OpenCode 增强功能](./05_Enhancement.md) | OpenCode 进阶能力与扩展配置 | 掌握基础操作后继续学习 |
+| [05 OpenCode 扩展能力：Skill、MCP 与 Plugin](./05_Enhancement.md) | 介绍 Skill、 MCP 和 Plugin 的内容 | 掌握基础操作后按需扩展 OpenCode |
 | [06 Harness](./06_Harness.md) | Harness 相关内容 | 需要进一步集成和自动化时 |
 
-## 推荐学习路径
 
-1. 按第 01 章安装 OpenCode，并确认 `opencode --version` 可以正常运行。
-2. 按第 02 章连接一个模型提供商，完成一次只读模型调用。
-3. 阅读第 04 章，区分普通终端 CLI 命令和 TUI 斜杠命令。
-4. 只有在源码位于远程主机、需要 Web/SDK 接入或已有容器运维体系时，再阅读第 03 章。
-5. 掌握基础操作后，再学习第 05、06 章的增强与自动化内容。
 
 ## 使用说明
 
@@ -60,6 +54,9 @@
 - [OpenCode 生态系统](https://opencode.ai/docs/zh-cn/ecosystem/)
 - [网络文档](https://opencode.ai/docs/zh-cn/network/)
 - [权限文档](https://opencode.ai/docs/zh-cn/permissions/)
+- [代理技能文档](https://opencode.ai/docs/zh-cn/skills/)
+- [MCP 服务器文档](https://opencode.ai/docs/zh-cn/mcp-servers/)
+- [插件文档](https://opencode.ai/docs/zh-cn/plugins/)
 - [规则文档](https://opencode.ai/docs/zh-cn/rules/)
 - [命令文档](https://opencode.ai/docs/zh-cn/commands/)
 - [快捷键文档](https://opencode.ai/docs/zh-cn/keybinds/)

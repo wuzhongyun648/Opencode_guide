@@ -4,7 +4,7 @@
 >
 > Skill、MCP Server 和 Plugin 可能来自第三方。安装前必须检查来源、代码、权限和数据流向。本文提到的社区扩展不是 OpenCode 官方安全背书，版本和服务条款也可能变化。
 
-## 1. 扩展方式介绍
+## 1. 三种扩展机制概述
 
 Skill、MCP 和 Plugin 都可以增强 OpenCode 的使用体验：
 
@@ -18,9 +18,7 @@ MCP：
 Plugin：
 OpenCode 启动或发生事件 -> Plugin Hook -> 补充或修改 OpenCode 的行为
 ```
-
-
-### 1.1 核心区别
+### 1.1 功能定位与适用场景
 
 | 对比项 | Skill | MCP | Plugin |
 | --- | --- | --- | --- |
@@ -35,7 +33,7 @@ OpenCode 启动或发生事件 -> Plugin Hook -> 补充或修改 OpenCode 的行
 
 Skill 和规则文件也不完全相同。`AGENTS.md` 或 `instructions` 通常会持续影响项目会话；Skill 先以名称和描述出现在可用列表中，完整内容由代理在相关任务中按需加载，因此更适合体积较大或只在特定任务中使用的说明。
 
-### 1.2 默认配置
+### 1.2 默认扩展与配置状态
 
 普通 OpenCode 安装的默认情况如下：
 
@@ -54,7 +52,7 @@ Skill 和规则文件也不完全相同。`AGENTS.md` 或 `instructions` 通常�
 
 ## 2. Skill：提供可复用的工作方法
 
-### 2.1 工作原理
+### 2.1 Skill 的加载机制
 
 一个 Skill 是包含 `SKILL.md` 的目录。文件开头的 YAML frontmatter 至少需要 `name` 和 `description`：
 
@@ -81,7 +79,7 @@ OpenCode 的处理过程是：
 
 `description` 不只是给人阅读的简介，也是代理选择 Skill 的主要依据。它应同时说明“做什么”和“什么时候使用”。Skill 可以附带脚本和参考资料；虽然 Markdown 本身不会自动执行代码，但其中的指令可能引导代理调用 Bash 或其他工具，因此仍然需要审查。
 
-### 2.2 Skill 在 OpenCode 的存储位置
+### 2.2 Skill 的目录结构与发现路径
 
 常用目录如下：
 
@@ -98,7 +96,7 @@ OpenCode 的处理过程是：
 
 `name` 必须由小写字母、数字和单个连字符组成，长度为 1 到 64 个字符，并与所在目录名称一致。文件名必须是大写的 `SKILL.md`。
 
-### 2.3 Skill 的下载方式
+### 2.3 Skill 的获取渠道与审查要点
 
 可以从以下入口查找：
 
@@ -116,9 +114,15 @@ OpenCode 的处理过程是：
 4. 仓库维护者、最近更新、Issue 和许可证是否可信。
 5. Skill 的作用是否可以由项目已有的 `AGENTS.md` 或命令更简单地实现。
 
-### 2.4  Skill 的安装示例
+### 2.4 `verification-before-completion` 的查找、安装与使用
 
-本节以 [obra/superpowers](https://github.com/obra/superpowers) 中的 `verification-before-completion`为例，介绍skill的下载安装方式。它要求代理在声称“修复完成”“测试通过”或“构建成功”之前，实际运行对应验证命令并检查结果。这条原则适用于大多数语言和项目，也有助于初级开发者区分“代码已经修改”和“问题已经验证”。
+本节以 [obra/superpowers](https://github.com/obra/superpowers) 中的 `verification-before-completion` 为例，完整演示如何查找、审查、下载、安装和使用一个 Skill。它要求代理在声称“修复完成”“测试通过”或“构建成功”之前，实际运行对应验证命令并检查结果。这条原则适用于大多数语言和项目，也有助于初级开发者区分“代码已经修改”和“问题已经验证”。
+
+**第 1 步：查找并确认来源**
+
+在 [Skills.sh](https://skills.sh/) 搜索 `verification-before-completion`，进入 [Skill 详情页](https://skills.sh/obra/superpowers/verification-before-completion)，确认维护仓库是 `obra/superpowers`，并查看页面提供的安装命令、安全扫描和源码入口。随后打开仓库中的 `SKILL.md`，确认它主要约束完成前的验证流程，没有要求上传源码或执行与验证无关的命令。
+
+**第 2 步：准备安装工具**
 
 本节使用 Vercel 维护的第三方 `skills` CLI 下载 Skill。该工具支持 OpenCode，但不是 OpenCode 自带命令。首次使用 `npx` 时会临时下载 CLI；它默认收集匿名安装遥测，可以通过 `DISABLE_TELEMETRY=1` 关闭。
 
@@ -131,13 +135,15 @@ npx --version
 
 如果命令不存在，需要先安装 Node.js LTS，或者按照 Skill 仓库的说明手动将完整 Skill 目录复制到 `.opencode/skills/`。只下载一个 `SKILL.md` 之前，要确认该 Skill 是否还依赖同目录中的脚本和参考资料。
 
-先查看仓库中可安装的 Skill，不执行安装：
+**第 3 步：查看并安装指定 Skill**
+
+先让 CLI 列出仓库中可安装的 Skill，不执行安装：
 
 ```bash
 npx skills add https://github.com/obra/superpowers --list
 ```
 
-打开 [Skills.sh 上的 Skill 页面](https://skills.sh/obra/superpowers/verification-before-completion) 和对应源码，确认内容后，在项目根目录安装：
+确认列表中存在 `verification-before-completion` 后，在项目根目录安装：
 
 ```bash
 npx skills add https://github.com/obra/superpowers \
@@ -168,7 +174,7 @@ git status --short
 
 首次安装的文件尚未被 Git 跟踪，普通 `git diff` 不会显示其内容。如果项目准备共享这个 Skill，可以将文件提交到 Git；如果只供个人试用，应避免误提交。
 
-### 2.5 使用和验证 Skill
+**第 4 步：重新启动并使用 Skill**
 
 安装后退出并重新启动 OpenCode，使新的 Skill 被发现。然后发出一个包含实际验证目标的任务，例如：
 
@@ -186,7 +192,18 @@ git status --short
 
 如果 `description` 与任务匹配，代理可以自行加载。是否每次都自动选择仍取决于模型判断；关键任务可以直接在提示词中指定 Skill 名称。
 
-### 2.6 管理 Skill 权限
+**第 5 步：验证完整闭环**
+
+本次实践满足以下条件才算完成：
+
+1. `.agents/skills/verification-before-completion/SKILL.md` 已生成并经过人工检查。
+2. 重新启动 OpenCode 后，代理能够加载该 Skill。
+3. `/details` 中可以看到 `skill` 工具调用。
+4. 代理实际执行了测试或构建命令，再根据输出报告结果。
+
+如果只看到代理复述 Skill 内容，却没有运行能够证明结论的命令，说明 Skill 已加载，但任务验证尚未完成。
+
+### 2.5 Skill 的权限管理
 
 可以在 `opencode.json` 中控制代理是否允许加载特定 Skill：
 
@@ -210,7 +227,7 @@ git status --short
 
 规则采用最后匹配优先，因此先写通用规则，再写具体例外。修改配置后需要退出并重新启动 OpenCode。
 
-### 2.7 更新和卸载 Skill
+### 2.6 Skill 的更新与卸载
 
 查看已经安装的 Skill：
 
@@ -234,7 +251,7 @@ npx skills remove verification-before-completion --agent opencode
 
 重新启动 OpenCode 后，再发送需要该 Skill 的任务，确认它已经不在可用列表中。如果安装时没有使用 `skills` CLI，也可以删除对应 Skill 目录，但应先确认该目录中没有自己的修改。
 
-### 2.8 推荐的 Skill
+### 2.7 其他推荐 Skill
 
 | Skill | 来源 | 适用场景 |
 | --- | --- | --- |
@@ -248,7 +265,7 @@ npx skills remove verification-before-completion --agent opencode
 
 ## 3. MCP：连接外部工具和服务
 
-### 3.1 工作原理
+### 3.1 MCP 的客户端与服务器机制
 
 MCP 全称 Model Context Protocol。OpenCode 充当 MCP Client，连接一个或多个 MCP Server，并把 Server 提供的工具注册给模型：
 
@@ -282,7 +299,7 @@ MCP 工具与 `read`、`bash` 等内置工具一起提供给模型。Server 越�
 opencode mcp list
 ```
 
-### 3.2  MCP 的下载地址
+### 3.2 MCP Server 的获取渠道与审查要点
 
 优先从以下来源查找：
 
@@ -301,11 +318,19 @@ opencode mcp list
 5. 是否可以使用测试账号、只读账号或更小的授权范围。
 6. 是否真的需要它，还是 OpenCode 的 `webfetch`、`websearch`、`grep` 和 `bash` 已经足够。
 
-### 3.3  MCP 安装示例
+### 3.3 Context7 的查找、配置与使用
 
-[Context7](https://github.com/upstash/context7) 用于检索当前版本的库和框架文档。它适合解决模型训练数据过时、API 名称变化和版本差异等问题，也是 OpenCode 官方 MCP 文档直接提供的示例。
+本节以 [Context7](https://github.com/upstash/context7) 为例，完整演示如何查找、审查、配置、连接和使用一个远程 MCP Server。Context7 用于检索当前版本的库和框架文档，适合解决模型训练数据过时、API 名称变化和版本差异等问题，也是 OpenCode 官方 MCP 文档直接提供的示例。
+
+**第 1 步：查找并确认来源**
+
+先在 [OpenCode MCP 文档](https://opencode.ai/docs/zh-cn/mcp-servers/#context7) 中找到 Context7 示例，再打开 [Context7 源码仓库](https://github.com/upstash/context7) 核对远程地址、认证方式和可用工具。确认将使用的地址为 `https://mcp.context7.com/mcp`，并了解查询内容会发送到远程服务。
+
+**第 2 步：选择连接方式**
 
 Context7 支持本地 CLI 和远程 MCP。本节采用远程 MCP，不需要安装本地 npm 包。请求会发送到 Context7 服务，不应使用它查询私有源码、密钥或内部文档。
+
+**第 3 步：写入配置并建立连接**
 
 在项目根目录创建或修改 `opencode.json`。如果文件已经存在，只添加 `mcp.context7`，不要覆盖原有模型、提供商或权限配置：
 
@@ -330,7 +355,7 @@ Context7 支持本地 CLI 和远程 MCP。本节采用远程 MCP，不需要安�
 
 修改配置后退出并重新启动 OpenCode。配置只在启动时加载，当前运行中的会话不会自动读取新配置。
 
-### 3.4 验证连接并使用 Context7
+**第 4 步：检查连接状态**
 
 在普通终端查看状态：
 
@@ -344,7 +369,9 @@ opencode mcp list
 opencode --print-logs --log-level DEBUG
 ```
 
-然后在 TUI 中发送一个带具体库和版本的问题：
+**第 5 步：调用 Context7 工具**
+
+在 TUI 中发送一个带具体库和版本的问题：
 
 ```text
 查询 React 当前文档中 useEffectEvent 的用途和限制，使用 context7，只总结文档，不修改文件。
@@ -360,7 +387,16 @@ When library or API behavior may depend on its current version, use Context7 and
 
 不要写成“任何问题都必须使用 Context7”，否则会产生不必要的网络请求和 Token 消耗。
 
-### 3.5 可选的 API Key 配置
+**第 6 步：验证完整闭环**
+
+本次实践满足以下条件才算完成：
+
+1. `opencode mcp list` 显示 `context7` 已连接。
+2. `/details` 中出现名称以 `context7_` 开头的工具调用。
+3. 回答包含与问题相关的当前文档信息，而不是只依赖模型原有知识。
+4. 项目文件没有因为文档查询被意外修改。
+
+### 3.4 Context7 的可选 API Key 配置
 
 Context7 无 API Key 也可以使用，但注册账号后可能获得更高的速率限制。不要把真实 Key 直接写入 `opencode.json`。先在启动 OpenCode 的环境中设置：
 
@@ -395,7 +431,7 @@ opencode
 
 OpenCode 的配置变量格式是 `{env:VARIABLE}`，不是 Shell 的 `${VARIABLE}`。如果环境变量没有设置，它会被替换为空字符串。
 
-### 3.6 控制 MCP 工具权限
+### 3.5 MCP 工具的权限控制
 
 MCP 工具注册时使用 Server 名称作为前缀。可以对 Context7 的全部工具设置权限：
 
@@ -421,7 +457,7 @@ MCP 工具注册时使用 Server 名称作为前缀。可以对 Context7 的全�
 
 权限只能控制模型是否调用已注册工具，不能修复 MCP Server 自身的漏洞，也不能限制 Server 在启动后自行执行的内部逻辑。本地 MCP 仍应在低权限账户或隔离环境中运行，远程 MCP 仍应使用最小权限凭据。
 
-### 3.7 管理和卸载 Context7
+### 3.6 Context7 的禁用、认证与卸载
 
 临时禁用而不删除配置：
 
@@ -455,7 +491,7 @@ opencode mcp logout <server-name>
 
 删除配置不会自动撤销服务商账号中的授权，必要时还应到服务商控制台撤销 Token 或 OAuth 应用授权。
 
-### 3.8 推荐的 MCP
+### 3.7 其他推荐 MCP
 
 | MCP | 用途 | 适用场景 | 主要注意事项 |
 | --- | --- | --- | --- |
@@ -469,7 +505,7 @@ opencode mcp logout <server-name>
 
 ## 4. Plugin：扩展 OpenCode 的运行行为
 
-### 4.1 工作原理
+### 4.1 Plugin 的加载与 Hook 机制
 
 Plugin 是 OpenCode 启动时加载的 JavaScript 或 TypeScript 模块。插件函数接收 OpenCode 客户端、项目目录和 Shell 等上下文，并返回一组 Hook：
 
@@ -497,7 +533,7 @@ export const ExamplePlugin = async ({ project, client, $, directory, worktree })
 
 插件不是受限的提示词。它作为代码在 OpenCode 运行环境中执行，可能访问文件、环境变量和网络，也可能调用 Shell。OpenCode 的工具权限主要约束代理调用工具，不能完整隔离插件自身。因此 Plugin 的信任要求高于 Skill 和远程 MCP。
 
-### 4.2 Plugin 的来源和加载方式
+### 4.2 Plugin 的加载来源与安装方式
 
 OpenCode 支持两种主要加载方式：
 
@@ -520,7 +556,7 @@ npm 插件会缓存在：
 
 OpenCode 会同时加载配置和插件目录中的插件。普通安装默认没有社区插件，但内部会加载模型提供商和认证相关的内置插件。内部插件不需要写入 `plugin` 数组，也不应重复安装。
 
-### 4.3  Plugin 的下载方式
+### 4.3 Plugin 的获取渠道与审查要点
 
 可以从以下入口查找：
 
@@ -538,9 +574,15 @@ OpenCode 会同时加载配置和插件目录中的插件。普通安装默认�
 5. 是否支持当前操作系统和 OpenCode 版本。
 6. 是否可以固定版本，避免每次启动获取不可预期的新代码。
 
-### 4.4 安装推荐 Plugin：`opencode-notifier`
+### 4.4 `opencode-notifier` 的查找、安装与使用
 
-本节推荐社区插件 [`@mohak34/opencode-notifier`](https://github.com/mohak34/opencode-notifier)。它监听任务完成、错误、权限请求和提问事件，并发送系统通知或播放提示音。通知插件的行为直观，不会为模型增加大量工具，适合作为第一个 Plugin 示例。
+本节以社区插件 [`@mohak34/opencode-notifier`](https://github.com/mohak34/opencode-notifier) 为例，完整演示如何查找、审查、安装、使用和验证一个 Plugin。它监听任务完成、错误、权限请求和提问事件，并发送系统通知或播放提示音。通知插件的行为直观，不会为模型增加大量工具，适合作为第一个 Plugin 示例。
+
+**第 1 步：查找并确认来源**
+
+先在 [OpenCode 生态系统](https://opencode.ai/docs/zh-cn/ecosystem/#插件) 中找到 `opencode-notifier`，再打开插件的 [GitHub 仓库](https://github.com/mohak34/opencode-notifier) 和 [npm 包页面](https://www.npmjs.com/package/@mohak34/opencode-notifier)。核对 npm 包名为 `@mohak34/opencode-notifier`，确认仓库说明、发布者、许可证和通知相关 Hook 与预期用途一致。
+
+**第 2 步：确认并固定版本**
 
 该插件不是 OpenCode 官方组件。开始前先查看 npm 当前版本：
 
@@ -549,6 +591,8 @@ npm view @mohak34/opencode-notifier@latest version
 ```
 
 截至本文核对时，`latest` 为 `0.2.8`。下面固定该版本以保证配置可复现；如果准备使用新版本，应先检查 Release Notes 和源码，再替换版本号。
+
+**第 3 步：写入插件配置**
 
 在全局配置 `~/.config/opencode/opencode.json` 中加入插件，使它对当前用户的所有项目生效：
 
@@ -562,6 +606,8 @@ npm view @mohak34/opencode-notifier@latest version
 ```
 
 如果文件已有其他配置，只把插件追加到现有 `plugin` 数组，不要覆盖 `model`、`provider`、`mcp` 或其他字段。只希望当前项目使用时，可以改为写入项目根目录的 `opencode.json`。
+
+**第 4 步：准备操作系统依赖**
 
 Linux 桌面通常需要通知命令。根据发行版选择一种安装方式：
 
@@ -581,7 +627,7 @@ Linux 还需要 `paplay`、`aplay`、`mpv` 或 `ffplay` 中的一个才能播放
 
 退出并重新启动 OpenCode。首次启动时，OpenCode 会使用 Bun 自动下载 npm 插件及依赖，之后从缓存加载。
 
-### 4.5 使用和验证通知插件
+**第 5 步：触发并验证通知**
 
 插件是事件驱动的，不需要在提示词中写“使用 notifier”。发送一个短任务：
 
@@ -622,7 +668,16 @@ notify-send "OpenCode notification test" "Desktop notifications are available"
 opencode --print-logs --log-level DEBUG
 ```
 
-### 4.6 更新、禁用和卸载 Plugin
+**第 6 步：验证完整闭环**
+
+本次实践满足以下条件才算完成：
+
+1. OpenCode 启动日志中没有插件安装或加载错误。
+2. 任务完成后能够收到系统通知或声音提示。
+3. 权限请求或问题事件仍由 OpenCode 正常处理，没有被插件阻断。
+4. 插件只响应配置的事件，没有为模型增加无关工具或修改项目文件。
+
+### 4.5 Plugin 的更新、禁用与卸载
 
 先查看新版本：
 
@@ -644,7 +699,7 @@ OPENCODE_PURE=1 opencode
 
 该模式跳过外部插件，适合进入 OpenCode 后修复配置。修复后退出，再不带该变量重新启动。
 
-### 4.7 其他值得按需使用的 Plugin
+### 4.6 其他推荐 Plugin
 
 | Plugin | 用途 | 适用场景 | 主要注意事项 |
 | --- | --- | --- | --- |
@@ -655,8 +710,6 @@ OPENCODE_PURE=1 opencode
 | `opencode-helicone-session` | 为模型请求加入 Helicone 会话信息 | 已使用 Helicone 观测的团队 | 涉及外部请求追踪和数据治理 |
 
 大型多代理、后台任务和 worktree 套件可能一次改变多个默认行为，不建议作为初学者的第一个 Plugin。
-
-
 
 ## 5. 安全检查清单
 
@@ -746,7 +799,7 @@ OPENCODE_PURE=1 opencode --print-logs --log-level DEBUG
 3. 将可疑 Skill 的权限设为 `deny` 或移出扫描目录。
 4. 每次只改变一项并重新启动，记录错误是否消失。
 
-## 参考资料
+## 7. 参考资料
 
 - [OpenCode Skill 文档](https://opencode.ai/docs/zh-cn/skills/)
 - [OpenCode MCP 文档](https://opencode.ai/docs/zh-cn/mcp-servers/)
