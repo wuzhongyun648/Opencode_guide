@@ -1,7 +1,5 @@
 # OpenCode 安装与首次运行
 
-> 文档依据 [OpenCode 官方文档](https://opencode.ai/docs/zh-cn/) 整理。最后核对日期：2026-08-14。
-
 ## 1. Opencode简介
 
 ### 1.1 产品形态与使用入口
@@ -16,7 +14,7 @@ OpenCode 是一个开源 AI 编码代理，主要提供以下使用入口：
 | IDE Extension     | VS Code、Cursor、Windsurf、VSCodium 等编辑器扩展 | 在编辑器中携带文件和选区上下文  | 先安装 CLI   |
 
 
-此外，CLI还提供 Web 和 Server 2种运行模式。相关内容见 [02_Model_Deployment.md](./02_Model_Deployment.md)。
+此外，CLI还提供 Web 和 Server 2种运行模式。相关内容见 [03_OpenCode_Server_Deployment.md](./03_OpenCode_Server_Deployment.md)。
 
 ### 1.2 官方安装方式与工具
 
@@ -179,7 +177,7 @@ docker run --rm -it \
   ghcr.io/anomalyco/opencode
 ```
 
-该命令挂载当前目录，但不会持久化容器中的认证信息和会话。长期运行、数据持久化及 Server 部署见 [02_Model_Deployment.md](./02_Model_Deployment.md)。
+该命令挂载当前目录，但不会持久化容器中的认证信息和会话。长期运行、数据持久化及 Server 部署见 [03_OpenCode_Server_Deployment.md](./03_OpenCode_Server_Deployment.md)。
 
 ### 2.8 验证 CLI 安装
 
@@ -328,13 +326,3 @@ opencode models
 ```
 
 如果提供商未认证、模型列表为空或调用报错，转到 [02_Model_Deployment.md](./02_Model_Deployment.md) 检查模型配置。
-
-## 参考资料
-
-- [OpenCode 中文文档](https://opencode.ai/docs/zh-cn/)
-- [OpenCode 下载页](https://opencode.ai/download)
-- [CLI 文档](https://opencode.ai/docs/zh-cn/cli/)
-- [IDE 文档](https://opencode.ai/docs/zh-cn/ide/)
-- [Windows WSL 文档](https://opencode.ai/docs/zh-cn/windows-wsl/)
-- [故障排除](https://opencode.ai/docs/zh-cn/troubleshooting/)
-- [GitHub Releases](https://github.com/anomalyco/opencode/releases)
