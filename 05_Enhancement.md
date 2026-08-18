@@ -52,6 +52,30 @@ Skill 和规则文件也不完全相同。`AGENTS.md` 或 `instructions` 通常�
 
 ## 2. Skill：提供可复用的工作方法
 
+Skill 是代理按需加载的专业工作方法，不是新的模型，也不等同于一个独立工具。
+
+Agent Skills 规范只要求 Skill 根目录中存在一个 `SKILL.md`，其他文件和目录都是可选资源：
+
+```text
+skill-name/
+├── SKILL.md          # 必需：名称、触发描述和主要流程
+├── references/       # 可选：按需读取的详细文档
+├── scripts/          # 可选：Python、Shell、JavaScript 等脚本
+├── assets/           # 可选：模板、图片和静态数据
+├── schemas/          # 可选：JSON Schema、XSD 等格式定义
+└── tests/            # 可选：脚本或生成结果的验证代码
+```
+
+复杂 Skill 可以接近一个小型软件包，包含依赖文件、公共模块、格式验证器和大量模板，但目录越多并不代表质量越高。推荐采用渐进式加载：启动时只提供 `name` 和 `description`，任务匹配后加载 `SKILL.md`，只有具体步骤需要时才读取参考资料、运行脚本或使用模板。这样可以减少无关上下文。
+
+`SKILL.md` 对其他文件的引用本质上是给 Agent 的操作指令。例如它可以要求填写 PDF 时先读取 `references/forms.md`，再执行：
+
+```bash
+python scripts/check_fillable_fields.py input.pdf
+```
+
+Skill 加载器不会因为存在 `scripts/` 就自动注册或执行其中的代码。Agent 必须先读取对应指令，再通过已有的 Bash 等工具执行脚本；脚本所需运行时、依赖和权限也必须由当前环境提供。因此审查 Skill 时不能只看 `SKILL.md`，还要检查它引用的文档、代码、模板、网络访问和许可证。
+
 ### 2.1 Skill 的加载机制
 
 一个 Skill 是包含 `SKILL.md` 的目录。文件开头的 YAML frontmatter 至少需要 `name` 和 `description`：
@@ -114,13 +138,32 @@ OpenCode 的处理过程是：
 4. 仓库维护者、最近更新、Issue 和许可证是否可信。
 5. Skill 的作用是否可以由项目已有的 `AGENTS.md` 或命令更简单地实现。
 
-### 2.4 `verification-before-completion` 的查找、安装与使用
+### 2.4 Anthropic `pdf` Skill 的查找、安装与使用
 
-本节以 [obra/superpowers](https://github.com/obra/superpowers) 中的 `verification-before-completion` 为例，完整演示如何查找、审查、下载、安装和使用一个 Skill。它要求代理在声称“修复完成”“测试通过”或“构建成功”之前，实际运行对应验证命令并检查结果。这条原则适用于大多数语言和项目，也有助于初级开发者区分“代码已经修改”和“问题已经验证”。
+本节以 [Anthropic Skills](https://github.com/anthropics/skills) 中的 [`pdf`](https://github.com/anthropics/skills/tree/main/skills/pdf) 为例，完整演示如何查找、审查、下载、安装和使用一个结构较完整的 Skill。它覆盖 PDF 文本与表格提取、合并、拆分、旋转、创建、表单填写、图片提取、加密和 OCR 等任务，并通过参考文档和 Python 脚本展示渐进式加载。
 
-**第 1 步：查找并确认来源**
+**第 1 步：确认来源、结构和许可证**
 
-在 [Skills.sh](https://skills.sh/) 搜索 `verification-before-completion`，进入 [Skill 详情页](https://skills.sh/obra/superpowers/verification-before-completion)，确认维护仓库是 `obra/superpowers`，并查看页面提供的安装命令、安全扫描和源码入口。随后打开仓库中的 `SKILL.md`，确认它主要约束完成前的验证流程，没有要求上传源码或执行与验证无关的命令。
+从 Anthropic 官方仓库进入 `skills/pdf/`，不要从名称相同的第三方镜像直接安装。先检查目录：
+
+```text
+pdf/
+├── SKILL.md
+├── forms.md
+├── reference.md
+├── LICENSE.txt
+└── scripts/
+    ├── check_fillable_fields.py
+    ├── convert_pdf_to_images.py
+    ├── extract_form_field_info.py
+    ├── extract_form_structure.py
+    ├── fill_fillable_fields.py
+    └── ...
+```
+
+`SKILL.md` 是入口，`reference.md` 保存高级处理方法，`forms.md` 规定表单填写流程并通过命令引用 `scripts/` 中的代码。脚本不会因为被放进目录就自动执行，而是由代理读取指令后通过 Bash 或 Python 调用。安装时必须复制完整目录，不能只保存 `SKILL.md`。
+
+该 Skill 的 frontmatter 和 `LICENSE.txt` 标明 `Proprietary`，并对提取、保留、复制、衍生和分发材料设置了额外限制。它是 source-available 参考实现，不等同于 Apache 2.0 开源软件。继续安装到 OpenCode 前，必须确认自己与 Anthropic 的适用协议明确允许这种使用；如果没有相应授权，应停止在源码审查阶段，改用许可证允许的 Skill。
 
 **第 2 步：准备安装工具**
 
@@ -133,21 +176,21 @@ node --version
 npx --version
 ```
 
-如果命令不存在，需要先安装 Node.js LTS，或者按照 Skill 仓库的说明手动将完整 Skill 目录复制到 `.opencode/skills/`。只下载一个 `SKILL.md` 之前，要确认该 Skill 是否还依赖同目录中的脚本和参考资料。
+如果命令不存在，需要先安装 Node.js LTS，或者在许可证允许的前提下手动复制完整 `skills/pdf/` 目录。不要先安装脚本提到的所有 PDF 工具；应根据实际任务确认需要 `pypdf`、`pdfplumber`、ReportLab、Poppler、qpdf、Tesseract 或其他依赖中的哪一部分。
 
 **第 3 步：查看并安装指定 Skill**
 
 先让 CLI 列出仓库中可安装的 Skill，不执行安装：
 
 ```bash
-npx skills add https://github.com/obra/superpowers --list
+npx skills add https://github.com/anthropics/skills --list
 ```
 
-确认列表中存在 `verification-before-completion` 后，在项目根目录安装：
+确认列表中存在 `pdf`，完成许可证和代码审查后，在项目根目录安装：
 
 ```bash
-npx skills add https://github.com/obra/superpowers \
-  --skill verification-before-completion \
+npx skills add https://github.com/anthropics/skills \
+  --skill pdf \
   --agent opencode \
   --copy \
   --yes
@@ -155,53 +198,59 @@ npx skills add https://github.com/obra/superpowers \
 
 其中：
 
-- `--skill` 只选择这一项，避免一次安装仓库中的全部 Skill。
+- `--skill pdf` 只选择 PDF Skill，避免一次安装仓库中的全部 Skill。
 - `--agent opencode` 指定为 OpenCode 安装。
-- `--copy` 复制文件而不是创建符号链接，方便初学者检查实际内容。
+- `--copy` 复制完整目录而不是创建符号链接，方便检查脚本和参考资料。
 - 未使用 `--global`，因此默认安装到当前项目。
 
-安装后应出现：
+安装后应至少出现：
 
 ```text
-.agents/skills/verification-before-completion/SKILL.md
+.agents/skills/pdf/
+├── SKILL.md
+├── forms.md
+├── reference.md
+├── LICENSE.txt
+└── scripts/
 ```
 
-使用编辑器打开 `SKILL.md` 再次检查实际安装内容，并查看 Git 状态：
+再次检查实际安装内容和 Git 状态：
 
 ```bash
 git status --short
 ```
 
-首次安装的文件尚未被 Git 跟踪，普通 `git diff` 不会显示其内容。如果项目准备共享这个 Skill，可以将文件提交到 Git；如果只供个人试用，应避免误提交。
+首次安装的文件尚未被 Git 跟踪，普通 `git diff` 不会显示其内容。受许可证限制，不要默认将 Anthropic PDF Skill 提交到自己的仓库或分发给其他人。
 
 **第 4 步：重新启动并使用 Skill**
 
-安装后退出并重新启动 OpenCode，使新的 Skill 被发现。然后发出一个包含实际验证目标的任务，例如：
+准备一个不含敏感信息的 `sample.pdf`，退出并重新启动 OpenCode，使新 Skill 被发现。然后执行一个只读任务：
 
 ```text
-检查当前项目是否可以正常构建，并说明结论。使用 verification-before-completion skill，不要修改文件。
+使用 pdf skill 检查 sample.pdf 的页数，提取第一页文本并概括内容。不要修改原 PDF，也不要安装新的系统软件。
 ```
 
-预期行为是代理先识别项目的构建命令，实际执行命令并读取退出状态，然后才报告能否构建。可以使用 `/details` 查看工具调用详情，确认代理加载了 `verification-before-completion`，并且没有只根据代码外观猜测结果。
+预期行为是代理加载 `pdf`，再根据文件类型和当前环境选择 `pdftotext`、Python PDF 库或其他已有工具。可以使用 `/details` 确认出现了 `skill` 调用和实际的文件处理命令。Skill 只提供流程和脚本，不会自动满足运行时依赖；如果环境缺少所需命令，代理应报告缺失项，而不是声称已经提取成功。
 
 也可以不显式指定 Skill：
 
 ```text
-检查测试是否全部通过，并给出证据，不要修改文件。
+读取 sample.pdf 的第一页并提取其中的表格，不要修改原文件。
 ```
 
-如果 `description` 与任务匹配，代理可以自行加载。是否每次都自动选择仍取决于模型判断；关键任务可以直接在提示词中指定 Skill 名称。
+`pdf` 的 `description` 明确覆盖任何读取或生成 PDF 的请求，因此代理可以自动选择它；关键任务仍可直接指定 Skill 名称。
 
 **第 5 步：验证完整闭环**
 
 本次实践满足以下条件才算完成：
 
-1. `.agents/skills/verification-before-completion/SKILL.md` 已生成并经过人工检查。
-2. 重新启动 OpenCode 后，代理能够加载该 Skill。
-3. `/details` 中可以看到 `skill` 工具调用。
-4. 代理实际执行了测试或构建命令，再根据输出报告结果。
+1. `.agents/skills/pdf/` 中的入口、许可证、参考文档和脚本均已完整生成并经过人工检查。
+2. 已确认许可证允许当前使用方式，且没有擅自提交或分发受限制材料。
+3. 重新启动 OpenCode 后，代理能够加载 `pdf`，并且 `/details` 中出现 `skill` 工具调用。
+4. 代理实际读取了测试 PDF，根据工具输出报告页数和内容，没有只复述 Skill 文档。
+5. 原始 `sample.pdf` 未被修改，缺少依赖时得到的是明确错误而不是虚假成功结论。
 
-如果只看到代理复述 Skill 内容，却没有运行能够证明结论的命令，说明 Skill 已加载，但任务验证尚未完成。
+如果只看到代理复述 PDF 处理方法，却没有读取测试文件或执行相应工具，说明 Skill 已加载，但 PDF 任务尚未完成。
 
 ### 2.5 Skill 的权限管理
 
@@ -213,7 +262,7 @@ git status --short
   "permission": {
     "skill": {
       "*": "ask",
-      "verification-before-completion": "allow"
+      "pdf": "allow"
     }
   }
 }
@@ -238,7 +287,7 @@ npx skills list --agent opencode
 更新当前项目中的 Skill：
 
 ```bash
-npx skills update verification-before-completion
+npx skills update pdf
 ```
 
 更新会改变本地文件。执行后应重新审查 `SKILL.md`、脚本和 Git 差异，不能因为旧版本可信就自动信任新版本。
@@ -246,7 +295,7 @@ npx skills update verification-before-completion
 卸载：
 
 ```bash
-npx skills remove verification-before-completion --agent opencode
+npx skills remove pdf --agent opencode
 ```
 
 重新启动 OpenCode 后，再发送需要该 Skill 的任务，确认它已经不在可用列表中。如果安装时没有使用 `skills` CLI，也可以删除对应 Skill 目录，但应先确认该目录中没有自己的修改。
@@ -259,15 +308,51 @@ npx skills remove verification-before-completion --agent opencode
 | `frontend-design` | Anthropic Skills | 实现具有明确视觉风格的前端页面 |
 | `react-best-practices` | Vercel Agent Skills | React 和 Next.js 性能检查 |
 | `web-design-guidelines` | Vercel Agent Skills | 可访问性、交互和 Web UI 审查 |
-| `pdf`、`docx`、`pptx`、`xlsx` | Anthropic Skills | 生成或处理对应文档 |
+| `docx`、`pptx`、`xlsx` | Anthropic Skills | 生成或处理对应文档，安装前检查各自许可证 |
 
 不建议根据排行榜一次安装大量 Skill。先根据项目类型选择一项，完成审查和验证后再增加下一项。
 
 ## 3. MCP：连接外部工具和服务
 
+MCP 是一套开放通信协议，不是一组固定工具。平常所说的“安装不同的 MCP”，通常是连接不同的 **MCP Server**：它们遵守相同协议，但可以分别提供 GitHub、数据库、浏览器或企业内部系统的能力。类似 HTTP 统一了请求和响应方式，却不规定每个网站必须提供相同业务接口，MCP 统一的是“如何发现和调用能力”，而不是“必须提供哪些能力”。
+
+完整架构包含 Host、Client 和 Server：
+
+```text
+用户
+  |
+  v
+OpenCode Host：运行模型、管理会话、权限和多个连接
+  |
+  +-- MCP Client A -- stdio/HTTP --> GitHub MCP Server
+  +-- MCP Client B -- stdio/HTTP --> Database MCP Server
+  `-- MCP Client C -- stdio/HTTP --> Browser MCP Server
+```
+
+一个 Host 可以管理多个 Client，每个 Client 连接一个 Server。Server 是提供能力的角色，不一定是远程机器：由 OpenCode 在本机启动的子进程仍然是 MCP Server。不同 Server 之间默认隔离，完整对话和跨 Server 编排由 Host 控制。
+
+MCP Server 可以提供三类核心原语，它们是 MCP 协议的一部分，而不是三套独立协议：
+
+| 原语 | 主要作用 | 类比 | 常见操作 |
+| --- | --- | --- | --- |
+| Tools | 执行函数或业务动作，可能产生副作用 | 函数、API | `tools/list`、`tools/call` |
+| Resources | 通过 URI 提供可读取的数据和上下文 | 文件、数据库记录 | 列出、读取、订阅资源 |
+| Prompts | 提供带参数的提示模板和工作流入口 | 命令模板 | 列出、获取 Prompt |
+
+一个 Server 可以只实现 Tools，也可以同时提供 Resources 和 Prompts。协议还定义版本协商、能力声明、JSON-RPC 消息、错误、进度、取消和授权等机制。截至 2026 年 8 月，官方已经发布 `2024-11-05`、`2025-03-26`、`2025-06-18`、`2025-11-25` 和 `2026-07-28` 等版本，当前版本是 `2026-07-28`。版本号表示最近一次不兼容变更的日期；实际部署必须以目标 Client 支持的版本为准，不能只根据最新规范判断兼容性。
+
+协议规定消息的结构和含义，传输方式负责把消息真正送到对方，包括消息分帧、进程或网络连接、流式响应、取消和终止。常用方式如下：
+
+| 传输方式 | 适用场景 | 工作方式 |
+| --- | --- | --- |
+| `stdio` | 本地 Server | Host 启动子进程，通过标准输入输出传递 JSON-RPC |
+| Streamable HTTP | 远程或多客户 Server | Client 向 HTTPS MCP 端点发送请求，接收 JSON 或 SSE 响应 |
+
+如果要把 MCP Server 提供给外部客户，仅实现 Tools 和 HTTP 端点还不够。生产服务还需要 HTTPS、目标 Client 与协议版本测试、OAuth 或其他可靠认证、细粒度 Scope、多租户隔离、Origin 校验、限流、超时、审计日志、监控告警和接入文档。当前 `2026-07-28` Streamable HTTP 使用单一 `POST /mcp` 端点，不再使用旧版本的协议级 Session 和独立 GET 流；反向代理还必须正确支持 SSE，避免缓冲实时响应。
+
 ### 3.1 MCP 的客户端与服务器机制
 
-MCP 全称 Model Context Protocol。OpenCode 充当 MCP Client，连接一个或多个 MCP Server，并把 Server 提供的工具注册给模型：
+MCP 全称 Model Context Protocol。更准确地说，OpenCode 是 MCP Host，在内部为每个 MCP Server 创建并管理 Client 连接，再把 Server 提供的工具注册给模型。为简化后续图示，也可以将这一连接组件称为 OpenCode MCP Client：
 
 ```text
 模型
@@ -505,9 +590,55 @@ opencode mcp logout <server-name>
 
 ## 4. Plugin：扩展 OpenCode 的运行行为
 
+Plugin 是 OpenCode 启动时直接加载和执行的 JavaScript/TypeScript 模块。它不是模型按需阅读的说明，也不是通过 stdio 或 HTTP 连接的独立服务，而是进入 OpenCode 运行环境，通过 Hook 观察、拦截或扩展内部流程：
+
+```text
+Skill  = 告诉 Agent 应该怎样完成任务
+MCP    = 通过标准协议向 Agent 提供外部能力
+Plugin = 在 OpenCode 运行过程中插入扩展代码
+```
+
+Plugin 常用于发送任务完成通知、记录审计日志、保护敏感文件、修改工具参数、注入 Shell 环境变量、扩展上下文压缩和注册自定义工具。如果需求只是增加一个简单函数，优先使用 `.opencode/tools/`；如果能力要同时提供给 OpenCode、Claude、VS Code 等多个 Host，优先创建 MCP Server；只有需要影响 OpenCode 自身生命周期时才使用 Plugin。
+
+Hook 是 OpenCode 核心代码预先留下的回调位置，Hook Handler 是 Plugin 注册到该位置的函数。以工具调用为例：
+
+```text
+模型生成工具调用
+      |
+      v
+tool.execute.before Hook  <- Plugin 可以检查、修改或拒绝参数
+      |
+      v
+OpenCode 真正执行工具
+      |
+      v
+tool.execute.after Hook   <- Plugin 可以检查结果、记录日志
+      |
+      v
+结果返回模型
+```
+
+OpenCode 启动时先调用 Plugin 函数并保存它返回的 Handler，之后执行到对应阶段时才回调这些函数。其内部逻辑可以简化为：
+
+```javascript
+const hooks = await plugin(context)
+
+await hooks["tool.execute.before"]?.(input, output)
+const result = await executeTool(output.args)
+await hooks["tool.execute.after"]?.(input, result)
+```
+
+Hook 与 Event 不是同一个概念。`session.idle`、`file.edited` 和 `permission.asked` 是“发生了什么”的 Event；`event` 是 Plugin 接收这些 Event 的 Hook；Plugin 中的异步函数则是 Hook Handler。直接 Hook 如 `tool.execute.before` 通常对应一个明确执行阶段，通用 `event` Hook 则接收多种事件并通过 `event.type` 区分。
+
+Plugin 只能注册 OpenCode 已经定义的 Hook，不能通过返回 `tool.execute.middle` 之类的新名称来增加或移动官方插入点，因为 OpenCode 核心没有代码调用它。Plugin 可以在自己的函数或自定义工具内部实现私有回调，但其他 Plugin 和 OpenCode 不会自动识别。真正新增官方 Hook 需要修改 OpenCode 核心、类型定义和测试，或者向项目提交扩展请求。
+
+Monkey Patch 与正式 Hook 不同。它是在运行时直接替换已有函数，例如先保存 `originalFetch`，再改写 `globalThis.fetch`。这种方式可以在没有 Hook 时强行拦截行为，但依赖内部实现和加载顺序，容易与其他 Plugin 冲突并在升级后失效。浏览器中的 Greasemonkey、Tampermonkey、Violentmonkey 沿用了“注入脚本并修改既有行为”的命名传统，但名称带 `Monkey` 不代表所有功能都采用严格意义上的 Monkey Patch。在 OpenCode 中应优先使用正式 Hook，缺少扩展点时优先向上游增加 Hook，避免依靠 Monkey Patch 维护生产功能。
+
+Plugin 的信任要求高于 Skill 和远程 MCP。它可能在用户发送任务前就读取文件和环境变量、访问网络、执行 Shell 或修改工具行为；OpenCode 的工具权限主要约束 Agent 调用工具，不能把 Plugin 本身变成安全沙箱。因此陌生仓库中的 `.opencode/plugins/` 和 npm Plugin 必须在启动前审查。
+
 ### 4.1 Plugin 的加载与 Hook 机制
 
-Plugin 是 OpenCode 启动时加载的 JavaScript 或 TypeScript 模块。插件函数接收 OpenCode 客户端、项目目录和 Shell 等上下文，并返回一组 Hook：
+具体加载时，插件函数接收 OpenCode 客户端、项目目录和 Shell 等上下文，并返回一组 Hook：
 
 ```javascript
 export const ExamplePlugin = async ({ project, client, $, directory, worktree }) => {
@@ -530,8 +661,6 @@ export const ExamplePlugin = async ({ project, client, $, directory, worktree })
 - 修改模型消息、请求参数或上下文压缩过程。
 - 注册新的模型工具。
 - 集成认证、日志、监控和外部服务。
-
-插件不是受限的提示词。它作为代码在 OpenCode 运行环境中执行，可能访问文件、环境变量和网络，也可能调用 Shell。OpenCode 的工具权限主要约束代理调用工具，不能完整隔离插件自身。因此 Plugin 的信任要求高于 Skill 和远程 MCP。
 
 ### 4.2 Plugin 的加载来源与安装方式
 
@@ -810,7 +939,7 @@ OPENCODE_PURE=1 opencode --print-logs --log-level DEBUG
 - [OpenCode 生态系统](https://opencode.ai/docs/zh-cn/ecosystem/)
 - [Skills.sh](https://skills.sh/)
 - [Vercel skills CLI](https://github.com/vercel-labs/skills)
-- [verification-before-completion](https://skills.sh/obra/superpowers/verification-before-completion)
+- [Anthropic PDF Skill](https://github.com/anthropics/skills/tree/main/skills/pdf)
 - [Context7](https://github.com/upstash/context7)
 - [opencode-notifier](https://github.com/mohak34/opencode-notifier)
 - [MCP Registry](https://registry.modelcontextprotocol.io/)
