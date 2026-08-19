@@ -1,107 +1,149 @@
-# Runtime Boundary：OpenCode 的 Harness 在哪里运行
+# Runtime Boundary：一条消息究竟跨过了哪些边界
 
-上一篇：[11 Agent 专业化与协作](./11_Agent_Specialization_and_Collaboration.md)
+上一篇：[11 Agent 专业化与协作](./11_Agent_Specialization_and_Collaboration.md) ｜ 系列入口：[Harness README](./README.md)
 
-系列入口：[OpenCode Harness 架构学习系列](./README.md)
+> 固定源码：OpenCode `0e3474509aa5ad16afcf9c439785514d6443c6af`（`dev`，2026-08-18）
+>
+> 分析主线：当前默认本地 TUI 的普通消息。监听模式与远程 `attach` 是互斥拓扑对照；native LLM adapter 与 native V2 是独立演进边界。
 
-## 1. 学习问题：一条消息实际跨过了哪些边界
+当学习者在 TUI 中要求“只读取 Harness README 和项目规则，再给出学习顺序”时，界面会逐步显示状态、Tool Call 和文本。这个直观现象容易带来三个误解：看见 `fetch` 就以为发生了 TCP 请求，看见界面实时更新就以为 Prompt POST 在逐 token 返回，看见 `native` 就以为普通 TUI 已经进入 native V2 Session Runtime。
 
-你已经知道 OpenCode 会组织 Context、调用 Model、执行 Tool 并保存 Session。现在换一个观察角度：这些工作在哪里发生？
+要判断一段代码或一次运行究竟跨过什么边界，必须同时回答三个不同问题：
 
-当零基础学习者在 TUI 输入：
+```text
+逻辑边界：谁负责 UI、路由、编排、模型、工具与状态？
+进程边界：这些角色位于 TUI 主线程、Worker 还是另一个进程？
+网络边界：哪些数据真正经过 socket、SSE 或 Provider transport？
+```
 
-> 请读取 Harness 教程的 README 和项目规则，告诉我应该从哪一篇开始；只做低风险观察，不修改文件。
+本篇先用这三个维度建立坐标，再比较三种互斥运行拓扑，随后沿当前默认路径追踪一次端到端请求。最后单独解释 Provider/Tool 执行位置、请求与事件双通道，以及 native adapter 与 native V2 的演进和恢复边界。
 
-界面会很快出现状态和文本。但这并不表示 Prompt 请求本身正在逐 token 返回，也不表示 TUI、Server、Provider 和 Tool 都在同一个模块中执行。默认本地模式、监听模式和远程 `attach` 还会改变传输方式。
+## 一、逻辑、进程与网络是三个独立维度
 
-### 最短答案
+### 1.1 逻辑边界回答“谁负责什么”
 
-TUI 是客户端，Session Orchestrator、Tool Runtime 和持久化服务位于 OpenCode Server/Harness 一侧，Model 请求越过 Provider 边界，普通本地 Tool 仍回到 OpenCode 一侧执行。
-
-默认本地 TUI 通过 Worker RPC 调用进程内 Router，不需要 TCP；远程 TUI 通过 HTTP 提交 Prompt，并通过独立 SSE 连接接收实时事件。当前 Prompt POST 等 Agent Loop 完成后返回最终 JSON，实时界面由另一条事件通道驱动。
-
-源码中还存在一条已接线的 native V2 Runtime。它和当前默认兼容 Runtime 共用部分事件、存储与 Server 基础设施，但 Prompt 入口、执行器和返回语义不同；固定源码下，当前 TUI 尚未切换到 native V2。
-
-## 2. 最小心智模型：先分角色，再看传输
-
-### 2.1 逻辑角色不等于进程
-
-先认识参与者：
+当前主线可以先拆成八个逻辑角色：
 
 | 逻辑角色 | 主要职责 | 是否天然是独立进程 |
 | --- | --- | --- |
-| TUI | 收集输入、显示状态、维护客户端 Store | 否，它是客户端运行时中的 UI |
-| SDK | 把方法调用编码成 HTTP 合同 | 否，它是客户端模块 |
-| Worker RPC Adapter | 本地模式中转发 Request 和 Event | 否，它表示 Worker/RPC 执行边界，不应直接等同于独立 Server 进程 |
-| Server Router / Handler | 匹配 API，调用 Session 服务 | 否，Router 可以被内存 `fetch` 调用，也可以挂到网络 listener |
-| Session Orchestrator | 运行 Agent Loop、组织 Provider Turn | 否，它是 Server/Harness 内的服务 |
-| Provider | 接收模型请求并返回流 | 可能是外部网络服务，也可能是本地 Provider；由 Provider 部署决定 |
-| Tool Runtime | 校验、授权并执行普通本地 Tool | 通常在 OpenCode Server/Harness 一侧 |
-| Event / Persistence | 保存状态并向观察者发布更新 | 通常在 OpenCode Server/Harness 一侧 |
+| TUI Prompt / Store | 收集输入、显示状态、维护客户端响应式状态 | 否 |
+| SDK | 把方法调用编码为 Request/Response 合同 | 否 |
+| Transport Adapter | 用 Worker RPC、HTTP 或 SSE 搬运请求与事件 | 否 |
+| Server Router / Handler | 匹配 API，进入具体 Session 服务 | 否 |
+| Session Orchestrator | 运行 Agent Loop，组织 Provider Turn 与 Tool continuation | 否 |
+| Provider Boundary | 把模型请求发送给实际 Provider，接收模型流 | 不确定，取决于 Provider 部署 |
+| Tool Runtime | 校验、授权并执行本地 Tool | 通常位于 OpenCode Runtime |
+| Event / Persistence | 保存 durable 状态并把运行更新发布给观察者 | 否 |
 
-如果把每一个源码模块都画成独立进程，图会产生错误直觉。Runtime Boundary 关注的是：调用跨过了模块边界、Worker 边界还是网络边界，以及状态是否跨进程持久化。
+这些名称描述的是模块职责，不是部署清单。`Server Router` 既可以被内存 `app.fetch(request)` 调用，也可以挂到监听端口；`SessionPrompt` 是服务模块，不因名字中有 Session 就成为独立进程；Provider 可以是远程云 API，也可以是本地模型服务。
 
-### 2.2 一张总图
+### 1.2 进程与 Worker 边界回答“代码在哪个执行上下文”
+
+默认 TUI 会创建 Bun Worker。TUI 侧负责交互、SDK 和 Store，Worker 侧承载 Router、Session Runtime 和事件总线。跨 Worker 需要 RPC 序列化，但这不等同于跨机器网络。
+
+因此可以把边界强度分开理解：
 
 ```text
-                 请求路径
-用户 -> TUI -> SDK -> [Worker RPC 或 HTTP] -> Router / Handler
-                                              |
-                                              v
-                                        Session Orchestrator
-                                         /              \
-                                        v                v
-                          Provider transport          Tool Runtime
-                                 |                        |
-                                 v                        v
-                              Model 服务            文件 / 进程 / API
-
-                 实时返回路径
-Session / Tool 状态 -> Event -> [Worker RPC event 或 SSE] -> TUI Store
+同一函数调用 < 同进程 Worker/RPC < 本机 socket < 跨机器网络
 ```
 
-读这张图时要注意：
+它们都能使用 Request/Response 形态，但故障、序列化、取消与性能语义不同。Worker 挂掉会丢失进程内执行状态；HTTP 断开不一定停止 Server 端工作；跨机器还叠加认证、网络分区和远端生命周期。
 
-- Prompt 请求和实时事件是两条通道；
-- Provider 和 Tool 的执行方向不同；
-- Worker RPC 和 HTTP 可以进入同一个 Router；
-- “经过 Router”不等于“经过 TCP 网络”。
+### 1.3 网络边界回答“是否真正经过 socket”
 
-## 3. 三种运行拓扑
+Web API 中的 `fetch` 是一种编程接口，不保证底层发生 TCP。默认本地路径把构造好的 Request 通过 RPC 交给 Worker，然后直接调用：
 
-### 3.1 默认本地 TUI：Worker RPC
+```ts
+const response = await Server.Default().app.fetch(request)
+```
 
-没有显式网络选项时，可以把默认拓扑理解为：
+它经过完整 Router 和 Handler，却没有为了 `http://opencode.internal` 建立内部 TCP 连接。只有监听模式或远程 `attach` 才在 TUI 与 Server 之间使用真实 HTTP/SSE。
+
+Provider transport 是另一条网络边界。即使 TUI 与 Server 使用内存 RPC，Server 仍可能通过网络请求远程模型；反过来，本地模型服务也可能使 Provider 位于同一机器。Client/Server 拓扑不能替 Provider 部署作结论。
+
+### 1.4 三条数据路径必须分开追踪
+
+一次任务至少同时存在三条方向不同的路径：
+
+```text
+请求路径
+TUI -> SDK -> Transport -> Router / Handler -> Session Orchestrator
+
+运行路径
+Session Orchestrator -> Provider
+                     -> Tool Runtime -> 文件 / 命令 / 外部 API
+
+观察与持久化路径
+Session / Tool -> Event / Storage -> RPC event 或 SSE -> TUI Store
+```
+
+Prompt 请求、实时 Event 和 durable state 是三种合同。某个状态可以已经通过 Event 出现在界面，但 Prompt POST 仍未完成；某个 whole Message 已经 durable，但客户端当时断开连接；某个 live delta 被当前界面看见，却无法在重启后从存储完整重建。
+
+## 二、三种互斥拓扑：选择一种，不是依次执行
+
+### 2.1 三种方案改变 Transport，不自动改变 Session Runtime
+
+默认本地、监听模式和远程 `attach` 是三种运行方案。一次 TUI 连接只处在其中一种主拓扑中，它们不是“本地 RPC → 本地 HTTP → 远程 HTTP”的三个学习步骤。
+
+| 方案 | 典型选择条件 | TUI 到 Server 请求 | Server 到 TUI 事件 | 主要边界 |
+| --- | --- | --- | --- | --- |
+| A. 默认本地 TUI | 未显式配置端口、hostname 或服务发现 | Worker RPC + 内存 Router fetch | Worker RPC event | TUI 与 Bun Worker |
+| B. 监听模式 | 使用端口、hostname 或 mDNS | HTTP | `/global/event` SSE | socket，可能仍在同一 CLI 宿主 |
+| C. 远程 `attach` | TUI 连接已有远程 Server | 跨网络 HTTP | 跨网络 `/global/event` SSE | Client 与远程 Server |
+
+三种方案中的普通 TUI Prompt 都调用兼容 `client.session.prompt(...)`。Transport 出现 HTTP 不等于启用 native V2，Server 位于远程也不等于进入另一套 Agent Loop。
+
+### 2.2 方案 A：默认本地 TUI 使用 Worker RPC
+
+#### 2.2.1 TUI 与 Runtime 位于同一 CLI 宿主的两侧
+
+未开启显式网络选项时，拓扑是：
 
 ```text
 一个 CLI 宿主
-├─ TUI 侧：Prompt、SDK、Reactive Store
-└─ Bun Worker 边界：Router、Session Runtime、Tool Runtime、GlobalBus
-   └─ Provider transport -> Model Provider
+├─ TUI 侧
+│  ├─ Prompt
+│  ├─ compatibility SDK
+│  └─ Reactive Store
+└─ Bun Worker
+   ├─ Server.Default().app.fetch
+   ├─ SessionPrompt / Tool Runtime
+   └─ GlobalBus
+      └─ Provider transport -> Model Provider
 ```
 
-TUI 创建 Worker，并给 SDK 注入两种适配器：
+#### 2.2.2 Request 与 Event 使用两套 Worker 适配器
 
-- `createWorkerFetch(...)` 负责请求；
-- `createEventSource(...)` 负责事件。
+TUI 创建 Worker 后，为 SDK 注入两种不同适配器：
 
-SDK 仍然构造标准 Request。TUI 侧把 URL、method、headers 和 body 通过 RPC 交给 Worker；Worker 重建 Request 后调用：
+```ts
+const transport = {
+  url: "http://opencode.internal",
+  fetch: createWorkerFetch(client),
+  events: createEventSource(client),
+}
+```
+
+`createWorkerFetch` 把 URL、method、headers 和完整 body 交给 RPC；Worker 重建 `Request`，调用内存 Router，再执行 `response.text()`，把完整响应交回 TUI。`createEventSource` 则订阅另一条 `global.event` RPC。
+
+所以默认路径有完整 HTTP 风格合同，却没有内部 TCP；有请求和事件两条通道，却都跨同一个 Worker/RPC 边界。
+
+### 2.3 方案 B：监听模式把同一 Router 挂到 socket
+
+当 `--port`、`--hostname` 或 mDNS 等条件成立，TUI 不再注入 Worker fetch/Event Source。Worker 调用 `Server.listen(...)`，把同一个 Router 挂到 URL：
 
 ```text
-Server.Default().app.fetch(request)
+TUI SDK --HTTP--> listener -> Router / Handler
+TUI SDK <--SSE--- /global/event
 ```
 
-这个调用经过完整 Router、Middleware 和 Handler，因此业务合同与 HTTP 服务一致。但它直接调用内存中的 Web Handler，没有为 `opencode.internal` 建立 TCP 连接。
+这次确实存在 socket，但不能据此把 Server 自动描述成另一台机器。它仍可能属于同一 CLI 宿主，只是 TUI 与 Server 通过监听器通信。
 
-这里的 `fetch` 是 Request/Response 编程接口，不是“必然访问网络”的同义词。
+变化的是 Transport；兼容 Session Handler、`SessionPrompt`、Provider 与 Tool Runtime 主线保持不变。
 
-### 3.2 本地监听模式：同一 Router 挂到 socket
+### 2.4 方案 C：远程 `attach` 使用跨网络 HTTP/SSE
 
-使用 `--port`、`--hostname` 或相关服务发现选项时，TUI 可以让 Worker 启动 listener，再通过 HTTP 请求同一 Router，并由 `/global/event` SSE 接收事件。这次存在 socket，但 Session Runtime 不会因此自动改变；传输变成 HTTP 不等于切换到 native V2。
-
-### 3.3 远程 `attach`：真正跨机器也仍是同一兼容入口
-
-`opencode attach <url>` 不注入本地 Worker fetch 和 event source。TUI 使用普通网络 fetch，并连接远程 Server 的 SSE：
+`opencode attach <url>` 只把远程 URL、directory 和认证 headers 传给 TUI，不注入本地 fetch 或 events：
 
 ```text
 本地 TUI --HTTP POST /session/:id/message--> 远程 OpenCode Server
@@ -109,43 +151,146 @@ Server.Default().app.fetch(request)
 远程 Server --Provider transport-----------> Model Provider
 ```
 
-远程模式改变 Client 与 Server 的位置，不改变普通 TUI 消息的 Session 入口。固定源码下，它仍调用兼容 `client.session.prompt(...)`，仍进入 `SessionPrompt`。
+SDK 因没有自定义 Event Source 而启动 `/global/event` SSE。普通 Prompt 仍进入远端 Server 上的兼容 `SessionPrompt`。
 
-## 4. 贯穿场景：读取 Harness 学习入口
+`attach` 回答“Client 和 Server 在哪里”，native V2 回答“Client 调用了哪套 Session 合同”。这是两个正交问题。
 
-下面沿着当前默认本地 TUI 走一遍，但只展开运行边界，不重复第 07 篇的 Agent Loop 细节。
+### 2.5 判断实际拓扑时追入口，不猜名称
 
-### 4.1 请求怎样进入 Session Runtime
-
-```text
-TUI -> client.session.prompt
-    -> Worker RPC: POST /session/:id/message
-    -> Router -> SessionHttpApi.prompt
-    -> SessionPrompt.prompt / loop
-    -> one or more Provider Turns
-    -> final Assistant WithParts -> one buffered JSON response
-```
-
-生成 SDK 中的类名可能带数字，那只是代码生成时的重名消歧，不能拿来判断是否进入 native V2。判断 Runtime 必须继续追 URL、Handler 和 Core 调用点。
-
-### 4.2 为什么 Prompt POST 不是 token stream
-
-兼容 Handler 使用了 streaming response API，但实际顺序是：
+判断当前运行方案可以按以下证据链：
 
 ```text
-先等待 promptSvc.prompt(...整个 Loop...)
--> 得到 final message
--> JSON.stringify(message)
--> 用只有一个值的 Stream 构造 response body
+TUI 是否注入 fetch/events？
+-> 是：默认 Worker RPC
+-> 否，URL 来自本地 Server.listen：监听模式
+-> 否，URL 来自 attach 参数：远程 attach
 ```
 
-默认本地 Worker 还会调用 `response.text()`，完整读取 body 后再回给 SDK。
+不要只看 `fetch`、URL 是否以 HTTP 开头、是否出现 Server 模块，也不要把三种拓扑画成顺序流程。
 
-因此，这个 POST 的准确语义是“长耗时的最终结果请求”。它可能跨越多个 Provider Turn 和 Tool 执行，但响应 body 不是逐 token 流。
+## 三、当前默认 TUI 的端到端请求主线
 
-### 4.3 为什么界面仍能提前更新
+### 3.1 总览：一次 Prompt 可以包含多个 Provider Turn
 
-TUI 提交 Prompt 时没有等待 Promise 完成才继续渲染，而是为失败挂接 `.catch(...)`。实时状态和文字通过另一条 Event Channel 返回：
+以默认本地 TUI 的只读学习请求为例，请求主线是：
+
+```text
+TUI submit
+-> SDK client.session.prompt(...)
+-> POST /session/:id/message
+-> Worker RPC fetch
+-> Server.Default().app.fetch
+-> SessionHttpApi.prompt
+-> SessionPrompt.prompt / loop
+-> 一个或多个 Provider Turn
+-> 普通本地 Tool 执行与 continuation
+-> final Assistant WithParts
+-> 一次完整 JSON response
+```
+
+第 07 篇解释了 Loop 内部怎样 continue、compact 或 stop。本篇关注这些模块之间怎样连接，以及哪些返回并不沿 Prompt POST 发生。
+
+### 3.2 TUI 提交兼容 SDK 请求，但不阻塞界面
+
+普通输入分支调用：
+
+```ts
+sdk.client.session
+  .prompt({
+    sessionID,
+    ...selectedModel,
+    agent: agent.name,
+    model: selectedModel,
+    variant,
+    parts: [...],
+  }, { throwOnError: true })
+  .catch(showError)
+```
+
+这里没有 `await`。TUI 发起 Promise 后继续清空输入和更新本地交互状态，运行中的 Message/Part 再由 Event Channel 驱动。因此“界面在 POST 完成前变化”是设计结果，不需要假设 Prompt body 自身逐 token 返回。
+
+生成 SDK 把 `client.session.prompt` 编码成兼容 `POST /session/{sessionID}/message`。生成类名中可能出现 `Session2` 等数字，它们只是代码生成时的重名消歧，不是 native V2 架构证据。
+
+### 3.3 Worker 复用完整 Router，但缓冲完整响应
+
+#### 3.3.1 Request 跨 Worker 后重新进入 Router
+
+TUI 侧先把 Request body 完整读出并通过 RPC 发送；Worker 侧重建 Request：
+
+```ts
+const request = new Request(input.url, {
+  method: input.method,
+  headers,
+  body: input.body,
+})
+const response = await Server.Default().app.fetch(request)
+const body = await response.text()
+```
+
+#### 3.3.2 `response.text()` 把返回值变成完整 body
+
+这段代码同时证明两件事：
+
+- 请求确实经过正常 Server Router、Middleware 与 Handler；
+- Worker RPC 不保留 streaming response body，而是用 `response.text()` 完整缓冲。
+
+所以默认本地既不是绕开 Server 直接调用 `SessionPrompt`，也不是通过 TCP 请求一个内部 Server。
+
+### 3.4 compatibility Handler 进入旧 `SessionPrompt`
+
+兼容 Route 把 Prompt 与 Message 查询放在 `/session/:sessionID/message` 组下，以 method 区分。`SessionHttpApi.prompt` 验证 Session 后，等待 Prompt 服务：
+
+```ts
+const message = yield* promptSvc.prompt({
+  ...ctx.payload,
+  sessionID: ctx.params.sessionID,
+})
+
+return HttpServerResponse.stream(
+  Stream.make(JSON.stringify(message)).pipe(Stream.encodeText),
+  { contentType: "application/json" },
+)
+```
+
+`promptSvc.prompt(...)` 在构造 response 前已运行完整 `SessionPrompt` Loop。虽然 Handler 使用 `HttpServerResponse.stream`，Stream 中只有一个最终 JSON 值。
+
+### 3.5 Provider 与 Tool 让主线在 Server 内继续推进
+
+`SessionPrompt` 为每个 Provider Turn 组装 Agent、Model、Context、Tools 和 Permission。Model 可能直接返回文本，也可能提出 `read` Tool Call。普通本地 Tool 经过 OpenCode 侧校验与执行，Tool Result 写回 Session，外层 Loop 再重载历史并发起下一 Provider Turn。
+
+从 Runtime Boundary 看，重要的是两个箭头方向不同：
+
+```text
+Server Runtime --Provider transport--> Model Provider
+Server Runtime --local Tool dispatch--> 文件系统 / 子进程 / 本地资源
+```
+
+模型只产生 Tool Call 意图，普通 Tool 的真实副作用不在 Provider 内执行。
+
+### 3.6 Prompt POST 最后只返回一个完整结果
+
+兼容 Handler 先等完整 Loop，再创建单值 JSON Stream；默认 Worker 又完整读取 `response.text()`。因此 Prompt POST 的准确语义是：
+
+```text
+长耗时最终结果请求
+≠ token stream
+```
+
+它返回 final Assistant `WithParts`，用于完成 SDK Promise。用户在等待期间看到的 Tool Call、状态和增量文本来自另一条通道。
+
+## 四、为什么界面实时更新：请求与事件是双通道
+
+### 4.1 请求通道负责提交与最终返回
+
+请求通道回答：输入是否被 Handler 接受，Session Loop 最终返回什么，HTTP/SDK 调用成功还是失败。
+
+在当前兼容路径中，它等待 final Assistant。这不代表中间状态不存在，只是中间状态不以 Prompt response token 的形式交给 TUI。
+
+### 4.2 事件通道负责运行中的可见性
+
+#### 4.2.1 领域更新先经过 Event 与兼容 Bridge
+
+运行中的状态沿以下链路到达当前 TUI：
 
 ```text
 SessionProcessor / Session Service
@@ -153,267 +298,352 @@ SessionProcessor / Session Service
 -> EventV2Bridge
 -> compatibility GlobalEvent
 -> GlobalBus
--> Worker RPC event
+-> Worker RPC event 或 /global/event SSE
 -> SDKProvider
 -> TUI reducer / Reactive Store
 ```
 
-如果换成监听模式或远程 `attach`，中间的 Worker RPC event 改成 `/global/event` SSE，前后模块基本不变。
+#### 4.2.2 Worker RPC 与 SSE 只是两种 live transport
 
-这解释了一个表面矛盾：
+默认本地 Worker 订阅进程内 `GlobalBus`，然后用 `Rpc.emit("global.event", event)` 转给 TUI。监听与 `attach` 则由 SDKProvider 连接 `/global/event` SSE。
+
+于是实际时间关系是：
 
 ```text
-Prompt POST 尚未完成
-+ 独立事件通道不断送来更新
-= 用户已经在 TUI 看见运行过程
+Prompt POST 仍在等待完整 Loop
+        +
+Event Channel 持续发送 Message / Part / status
+        =
+TUI 已显示运行过程
 ```
 
-## 5. 最终响应、实时事件和持久化不是一回事
+### 4.3 Event、Bridge、Transport 与 Store 各有一层职责
 
-### 5.1 EventV2、Bridge、Transport 和 Store
+这条链不应压缩成一句“Server 用 SSE 发事件”：
 
-看到一个 Part 出现在屏幕上时，需要分别问 Prompt 是否最终返回、当前连接是否收到 live event、状态是否已经 durable；三者可以在不同时间成立。
+- **EventV2 / Projector**：把 durable event 与 projection 放进事务，在提交后通知观察者；live-only event 则只通知当前观察者。
+- **EventV2Bridge**：把共享 Event 转成旧客户端能理解的 compatibility payload；durable event 还会额外生成 `sync` envelope。
+- **GlobalBus**：当前 executable 内的进程级发布总线。
+- **Worker RPC 或 SSE**：当前拓扑使用的 live transport。
+- **SDKProvider / TUI reducer**：批处理事件，把 Message、Part 和 delta 合并进响应式 Store。
 
-当前兼容路径大致分成五层：
+它们分别解决状态定义、兼容转换、进程内分发、跨边界传输和 UI 投影问题。缺少其中任何一层都不能由另一层自动替代。
 
-| 层 | 解决的问题 |
-| --- | --- |
-| EventV2 + Projector | durable event 如何在 transaction 中投影、写入并在提交后通知 |
-| `EventV2Bridge` | 怎样把共享 Event 转成旧客户端理解的 compatibility payload |
-| `GlobalBus` | 怎样在 executable 内发布 GlobalEvent |
-| Worker RPC / SSE | 怎样把 event 送到当前客户端连接 |
-| TUI Store | 怎样合并 Message、Part 和 delta 并驱动界面 |
+### 4.4 whole update、live delta 与 durable `sync` 不是同一件事
 
-完整 Message/Part update 可以是 durable；`message.part.delta` 是 live-only。durable 描述能否从存储重读，RPC/SSE 描述现在怎样传输，两者不是二选一。
+#### 4.4.1 同一段输出可以同时产生 whole、delta 与 `sync`
 
-### 5.2 当前 TUI 不用 `sync` envelope 做重放
+当前兼容 Message/Part whole update 可以是 durable；`message.part.delta` 是 live-only。`EventV2Bridge` 对 durable event 额外发出带 sequence、aggregateID 与版本的 `sync` envelope：
 
-`EventV2Bridge` 对 durable event 除了产生普通 compatibility payload，还会产生带 sequence 和 aggregate identity 的 `sync` envelope。
+```ts
+if (event.durable === undefined) return
+GlobalBus.emit("event", {
+  payload: {
+    type: "sync",
+    syncEvent: {
+      seq: event.durable.seq,
+      aggregateID: event.durable.aggregateID,
+      data: event.data,
+    },
+  },
+})
+```
 
-但当前 TUI 的 `useEvent` 会明确丢弃 `payload.type === "sync"`，TUI reducer 消费的是普通 compatibility event。`SyncProvider` 这个名字也不能反推出它在做 EventV2 durable replay；它主要负责 GET hydration 和 live reducer。
+#### 4.4.2 当前 TUI 使用 live compatibility event 加 snapshot hydration
 
-进入 Session 页面时，TUI 会通过 GET API 读取 Session、最近消息、Todo 和 Diff，并用 hydration tracker 避免旧 snapshot 覆盖刚到的 live update。这是 snapshot hydration，不是 cursor replay。
+但当前 TUI 的 `useEvent` 明确忽略 `payload.type === "sync"`。它消费普通 compatibility event，并通过 GET hydration 读取 Session、Message、Todo、Diff 等 snapshot。
 
-## 6. Provider 在哪里，Tool 又在哪里
+所以当前 TUI 的恢复模型是“live event + snapshot hydration”，不是“按 durable event cursor replay”。名称 `SyncProvider` 也不能作为 replay 已接线的证据。
 
-### 6.1 Provider boundary
+### 4.5 Durable 与 live transport 是两个维度
 
-当前默认兼容 Runtime 中，`LLM.run` 准备 Model、Messages、Tools、headers 和 Provider options。默认路径通过 AI SDK `streamText(...)` 发起 Provider request，再把 Provider 的原始流适配成统一 `LLMEvent` 交给 `SessionProcessor`。
+判断一项数据的恢复能力，应分别问：
 
 ```text
-OpenCode Session Runtime
+它是否 durable？       决定能否从存储重读
+当前订阅是否能 replay？ 决定断线后能否从 cursor 补事件
+它是否只有 live delta？ 决定重连后是否存在不可恢复后缀
+```
+
+一个 durable event 可以通过 volatile stream 实时送达；一个 live delta 可以被当前连接看见却永不落盘。不能把“事件实时到达”与“状态可恢复”合并成一个判断。
+
+## 五、Provider 与 Tool：调用意图和真实副作用位于不同边界
+
+### 5.1 当前默认 Provider Runtime 使用 AI SDK
+
+兼容 `SessionPrompt` 通过 `LLM.run` 准备 Model、Messages、Tools、headers 和 Provider options。默认路径调用 AI SDK 的 Provider adapter，并把原始 stream 转换成统一 `LLMEvent`：
+
+```text
+SessionPrompt / SessionProcessor
+-> LLM.run
 -> AI SDK Provider Adapter
 -> Provider transport
 -> Model Provider
 ```
 
-Provider 可能是远程 API，也可能是本地模型服务；Session 模块只定义调用边界，不决定 Provider 一定部署在哪台机器。
+Provider request 可能离开当前机器，也可能连接本地服务。Runtime 代码只定义调用边界，具体网络位置要看 Provider 配置。
 
-### 6.2 普通本地 Tool 不在 Provider 内执行
+### 5.2 普通本地 Tool 在 OpenCode 一侧执行
 
-Model Provider 可以返回：
+Model 返回 `read(path=...)` 时，Provider 只输出一个 Tool Call。OpenCode 的 Tool Runtime 随后完成：参数 schema 校验、Permission、实际 I/O、Tool Result 持久化和 continuation。
 
-```text
-read(path="Opencode_Harness/README.md")
+因此文件读写、Shell 子进程和普通本地 Tool 的副作用发生在运行 OpenCode Server/Harness 的环境中。远程 `attach` 时，这意味着 Tool 通常作用于远端 Server 所在环境，而不是本地 TUI 所在机器。
+
+### 5.3 `providerExecuted` hosted tool 是明确例外
+
+某些 hosted tool 由 Provider 执行，并带有 `providerExecuted` 标记。OpenCode 会识别它们，避免再走普通本地同名 dispatch。
+
+解释“Tool 在哪执行”时应先区分普通 local tool 与 hosted tool，不能只从工具名称、Provider 返回了 Tool Call，或界面显示 Tool Part 来猜测。
+
+## 六、native LLM adapter 不等于 native V2 Session Runtime
+
+### 6.1 实验开关只替换 Provider 适配层
+
+#### 6.1.1 支持时走 native adapter，不支持时回退 AI SDK
+
+`OPENCODE_EXPERIMENTAL_NATIVE_LLM` 对应 `experimentalNativeLlm`。旧 `LLM.run` 在这一层尝试 `LLMNativeRuntime.stream(...)`：
+
+```ts
+if (flags.experimentalNativeLlm) {
+  const native = LLMNativeRuntime.stream({...})
+  if (native.type === "supported") {
+    return { type: "native", stream: native.stream }
+  }
+  // 不支持时继续使用 AI SDK 路径
+}
 ```
 
-这只是 Tool Call。真正的读取由 OpenCode 一侧完成：
+#### 6.1.2 两种 Adapter 都回到旧 `SessionProcessor`
 
-```text
-Provider 产生 Tool Call
--> OpenCode 校验参数和 Permission
--> OpenCode Tool Runtime 读取文件
--> 保存 Tool Result
--> 下一 Provider Turn 再把结果交给 Model
-```
-
-Shell、文件写入和其他普通本地 Tool 的副作用也位于 OpenCode Runtime。模型服务不会因为生成了调用 JSON 就直接获得用户文件系统。
-
-例外是标为 `providerExecuted` 的 hosted tool：它由 Provider 执行，OpenCode 会识别该标记并跳过本地同名 dispatch。解释某个 Tool 的执行位置时，需要先确认它属于哪一类。
-
-### 6.3 旧 Loop 下的 Native Adapter 不是 native V2 Session
-
-显式开启 `OPENCODE_EXPERIMENTAL_NATIVE_LLM` 时，当前旧 `SessionPrompt` Loop 可以尝试使用 Native LLM Adapter，不支持的 Provider 或配置再回退到 AI SDK。
-
-这只替换 Provider request/stream 的适配层：
+Native Adapter 与 AI SDK 最终都输出统一 `LLMEvent`，交给同一个旧 `SessionProcessor`。因此开启开关后的链路仍是：
 
 ```text
 SessionPrompt old Loop
--> Native LLM Adapter
+-> Native LLM Adapter（支持时）
 -> Provider
 ```
 
-外层仍是 `SessionPrompt`，所以不能把“使用 native Provider adapter”写成“使用 native V2 Session Runtime”。
+### 6.2 判断 Session Runtime 必须追更外层调用点
 
-## 7. 当前兼容 Runtime 与 native V2 为什么会共存
+“native”在这里描述 Provider request/stream adapter，不描述输入 admission、Session 调度或事件合同。只要外层仍由 `SessionHttpApi.prompt -> SessionPrompt.prompt -> loop` 驱动，就还是当前兼容 Session Runtime。
 
-### 7.1 同一个 executable 中有两套路由
+是否进入 native V2，必须继续追踪 URL、Handler 和 Core：`/api/session/:id/prompt -> native SessionHandler -> V2Session.prompt`。一个底层适配器名称不能替代完整调用链证据。
 
-当前 executable 把以下 Router layer 合并在一起：
+## 七、current 与 native V2 在同一个 Router 中共存
 
-- compatibility `/session/*`、`/global/*` 和旧事件入口；
-- native `/api/*` Protocol/Server 路由；
-- OpenAPI 文档和 UI fallback。
+### 7.1 共存方式是路由 Layer 合并，不是两个 Server 代理
 
-这不是两个 Server 进程互相代理，而是同一个 Router tree 中的并列路由。因此同一个 executable 可以同时响应：
+#### 7.1.1 compatibility 与 native Route 位于同一 Layer tree
+
+当前 executable 的 `createRoutes()` 合并兼容与 native 路由：
+
+```ts
+return Layer.mergeAll(
+  rootApiRoutes,
+  eventApiRoutes,
+  instanceRoutes,
+  serverRoutes,
+  docRoute,
+  uiRoute,
+)
+```
+
+其中 `instanceRoutes` 包含兼容 `/session/*`，`serverRoutes` 来自 native Protocol/Server 的 `/api/*`。它们位于同一 Effect Router layer tree，不是旧 Server 通过 HTTP 代理到另一个新 Server。
+
+所以同一进程能同时响应两条路由：
 
 ```text
 POST /session/:id/message
 POST /api/session/:id/prompt
 ```
 
-“native API 可达”和“当前 TUI 默认使用 native API”是两个不同命题。
+#### 7.1.2 Route 可达不代表当前 TUI 已选择它
 
-### 7.2 两条 Prompt 路径
+路由可达只证明实现已接线；当前 TUI 到底使用哪条，仍要查看客户端调用点。
+
+### 7.2 两套 Prompt 合同不能按名字互换
 
 | 边界 | 当前默认兼容 Runtime | native V2 Runtime |
 | --- | --- | --- |
-| 客户端调用 | `client.session.prompt(...)` | `client.v2.session.prompt(...)` 或 native Client |
-| HTTP | `/session/:id/message` | `/api/session/:id/prompt` |
+| Client | `client.session.prompt(...)` | `client.v2.session.prompt(...)` 或 native Client |
+| HTTP | `POST /session/:id/message` | `POST /api/session/:id/prompt` |
 | Handler | `SessionHttpApi.prompt` | native `SessionHandler` |
 | Core | `SessionPrompt.prompt -> loop` | `V2Session.prompt -> SessionInput.admit -> optional wake` |
-| POST 返回 | 完整 Loop 后的 final Assistant `WithParts` | durable `SessionInput.Admitted` receipt |
+| POST 成功值 | final Assistant `WithParts` | durable `SessionInput.Admitted` receipt |
+| 是否等待 Provider 完成 | 是 | 否 |
 | 当前普通 TUI | 已接线 | 未接线 |
 
-最显著的架构变化，是 native V2 把“输入已经被接受”和“Provider 已经完成工作”分开。
+两个 POST 都不是 token stream，但等待语义相反：兼容 POST 等整个旧 Loop，native POST 只等输入 durable admission 与 wake 调度，不等待 Runner 完成。
 
-## 8. native V2 的运行模型
+## 八、native V2：从最终响应合同演进为 admission 与 execution 分离
 
-### 8.1 Durable admission 与执行调度分离
+### 8.1 Prompt 先 durable admit，再选择是否 wake
 
-native Prompt 先写入 durable `session_input`。只有 `resume !== false` 时才调用 `SessionExecution.wake(...)`；`resume:false` 可以只接纳输入，不立即请求执行。
+#### 8.1.1 POST 首先提交一条 durable input
 
-```text
-native Prompt POST
--> durable admit
--> 返回 Admitted receipt
--> optional advisory wake
--> Runner 在安全边界 promotion
--> Provider Turn / Tool Settlement
+native `V2Session.prompt` 的关键顺序是：
+
+```ts
+const admitted = yield* SessionInput.admit(db, events, {
+  id: messageID,
+  sessionID: input.sessionID,
+  prompt,
+  delivery,
+})
+
+if (input.resume !== false) yield* execution.wake(admitted.sessionID)
+return admitted
 ```
 
-因此 native Prompt POST 也不是 token stream，但它和兼容 POST 的等待语义几乎相反：兼容 POST 等最终结果，native POST 只等接纳完成。
+#### 8.1.2 `resume` 决定是否唤醒执行，不改变 admission 事实
 
-### 8.2 Process-local Coordinator 与 Location-scoped Runner
+它把“Server 已可靠接纳输入”和“Runner 已完成 Provider 工作”拆开。`resume:false` 可以只记录输入，不立即运行；默认 resume 则向执行层发出 wake。HTTP Handler返回 admission receipt，而不是最终 Assistant。
 
-`SessionExecutionLocal` 使用进程级 `SessionRunCoordinator`：同 Session 的 resume 可以 join，wake 可以 coalesce，不同 Session 可以并行；Runner 在 drain 开始时按 Session Location 获取运行服务。执行所有权仍是 process-local，尚无 clustered ownership 和跨进程 fencing。
+### 8.2 process-local Coordinator 管理同 Session 串行化
 
-### 8.3 Native Provider 与 Tool settlement
+#### 8.2.1 `run`、`wake` 与 Session key 决定进程内并发关系
 
-native `SessionRunner` 对每个 Provider Turn 明确调用一次 `llm.stream(request)`。普通本地 Tool Call 先形成 durable 调用事实，再由 Runner 启动 Tool settlement；需要 continuation 时重新读取投影历史。
+`SessionExecutionLocal` 使用全局 `SessionRunCoordinator`：
 
-这条路径不经过旧 AI SDK `streamText`，也不桥接旧 `SessionPrompt.loop`。当前 Provider route 和 Tool/Plugin 覆盖仍未达到兼容 Runtime 的全部能力面。
+- 同一 Session 的 `run` 在活跃时 join 当前执行；
+- `wake` 在活跃时记录一个 coalesced follow-up；
+- 不同 Session 使用不同 key，可以并行；
+- `interrupt` 只中断当前进程拥有的 active fiber；
+- Runner 开始 drain 时按 Session Location 获取相应服务环境。
 
-### 8.4 Native event API
+#### 8.2.2 进程内协调器不是跨进程执行所有权协议
 
-native V2 提供三种不同观察方式：
+这是一套进程内所有权模型，不是集群调度器。固定基线没有跨进程 fencing、租约或 stale owner 接管协议。
 
-| API | 语义 |
-| --- | --- |
-| `GET /api/event` | 全 Server 的 volatile live stream，不回放历史 |
-| `GET /api/session/:id/event?after=N` | Session durable event 的 replay-and-tail，可按 sequence cursor 续接 |
-| `GET /api/session/:id/history?after=N&limit=M` | durable history 的有限页查询 |
+### 8.3 Runner 显式划分 Provider Turn 与 Tool settlement
 
-per-session event cursor 只重放 durable event，不补回 live-only text/reasoning/tool-input delta。当前 TUI 尚未消费这些 native 合同。
+#### 8.3.1 每个 Turn 明确经过调用、结算与历史重载
 
-## 9. 架构演进解决了什么，又还缺什么
+native Runner 每个 Turn 显式调用一次 `llm.stream(request)`。本地 Tool Call 先记录 durable 调用事实，再执行 Tool settlement；需要 continuation 时，下一 Turn 重读投影后的 Session History。
 
-native V2 不是因为包名更新或使用 Effect 就自动更可靠。真正的变化是从“visible User Message -> old Loop -> final response”，演进为“durable admission -> promotion -> process-local execution”，并提供 durable Session cursor/history。
+这使阶段边界更清楚：
 
-这些变化带来的价值包括：
+```text
+admitted input
+-> promotion 成 User Message
+-> Provider Turn
+-> durable Tool Call
+-> Tool execution / settlement
+-> history reload
+-> continuation 或结束
+```
 
-- Prompt 接纳、模型可见性和立即执行不再绑定成一个动作；
-- steer 与 queue 有显式 durable delivery 语义；
-- Provider Turn、Tool Call 和 Tool Settlement 的边界更清楚；
-- per-session durable cursor 使客户端可以从已知 sequence 续读事实；
-- Runner 的 Location scope 为不同工作区运行环境建立了明确接口。
+#### 8.3.2 独立 Runner 不代表旧能力已经全部迁移
 
-但固定源码下仍需保留以下限制：
+这条路径不桥接旧 `SessionPrompt.loop`，Provider 也直接使用 native `LLMClient` 路由。但“拥有独立 Runner”不代表旧 Runtime 的每项能力已经迁移。
 
-- 当前 TUI 仍使用兼容 Prompt、Event 和 hydration 合同；
-- native Provider、Context、Tool、Plugin 等能力覆盖仍有 partial 项；
-- Task/Subagent 父子 Session 编排尚未完成；
-- 一般 Provider Retry 和 Doom Loop 等价保护尚未完成；
-- 手动 native `compact` 和独立 `wait` 合同存在，但 Core 操作当前返回 unavailable；
+### 8.4 native Event API 区分 volatile live 与 durable replay
+
+#### 8.4.1 全 Server Event 是 volatile live SSE
+
+`GET /api/event` 订阅全 Server 的实时事件。Handler 先建立容量有限的 bounded live stream，再发送 `server.connected`；它没有接受历史 cursor，也不会为新连接重放断线前的事件。这个接口解决“从现在开始观察”，不解决按 Session 恢复历史。
+
+#### 8.4.2 Session Event 与 History 读取 durable sequence
+
+`GET /api/session/:id/event?after=N` 先重放指定 aggregate sequence 之后的 Session durable events，再继续 tail 新提交的 durable events。`GET /api/session/:id/history?after=N&limit=M` 则只读取有限的一页 durable history，并返回是否还有后续页。前者是长连接 replay-and-tail，后者是有限分页读取，不能因为都使用 `after` 就把它们看成同一合同。
+
+#### 8.4.3 Cursor 不补 live-only delta，当前 TUI 也未消费这些 API
+
+per-session cursor 只重放 durable event，不补回 live-only text、reasoning 或 tool-input delta。当前普通 TUI 也未消费这些 native API；它仍使用兼容 `/global/event` 与 GET hydration。
+
+## 九、演进价值与当前 parity 边界
+
+### 9.1 native V2 已经是可达的 Runtime slice
+
+固定源码中，native Protocol、Handler、`V2Session.prompt`、durable admission、process-local execution、Runner、Tool settlement 和 Session cursor API 都已接线并有测试。它不是只有目录、类型或规格计划的空壳。
+
+Admission 与 execution 分离带来几项清楚的工程边界：输入可精确重试，`resume:false` 可只接纳，steer/queue 可以在安全点 promotion，客户端可以用 durable Session sequence 续接历史。
+
+### 9.2 仍未达到当前兼容 Runtime 的完整能力面
+
+固定基线仍需保留这些限制：
+
+- 当前 TUI 的 Prompt、Global Event 和 hydration 合同没有迁移到 native；
+- Provider、Context、Tool 和 Plugin 覆盖仍有 partial 部分；
+- Task/Subagent 父子 Session 编排尚未完整迁移；
+- 一般 Provider Retry、Doom Loop 与旧 Runtime 的等价保护未完成；
+- native `compact` 与独立 `wait` 合同存在，但 Core 操作当前不可用；
 - execution ownership 仍是 process-local；
-- clustered execution、stale-owner fencing 和自动 post-crash continuation 尚未实现。
+- clustered execution、stale-owner fencing 与自动 post-crash continuation 尚未实现。
 
-所以准确描述是：native V2 是已接线、可达、可测试但尚未完成全部 parity 的独立 Runtime slice；当前产品主线仍由兼容 Runtime 服务 TUI。
+因此最准确的定位是：**native V2 已接线、可达、可测试，但仍是未完成全部 parity 的独立 Runtime；当前普通 TUI 主线继续使用兼容 Runtime。**
 
-## 10. 断线、中断、恢复与崩溃是四件事
+## 十、失败与恢复：五种相似现象不能混写
 
-### 10.1 客户端请求失败不会自动回滚 Session
+### 10.1 Prompt 请求失败不等于任务事务回滚
 
-Prompt POST 的网络错误只说明 Client 没有成功取得响应。User Message 可能已经 durable，Provider 可能已经返回部分输出，Tool 也可能已经产生副作用。
+SDK validation、网络或 Handler 错误会让 Prompt Promise reject，TUI 显示发送失败。但 User Message 可能已经 durable，Provider 可能已经产生部分输出，Tool 也可能已执行副作用。
 
-请求失败不能被理解成整个 Agent 任务的事务回滚。
+Request failure 只说明 Client 没有取得这次请求的正常返回，不能推出整次任务“从未发生”。Agent 任务不是包裹 Provider 和外部 I/O 的全局数据库事务。
 
-### 10.2 断开事件连接不会自动停止 Agent
+### 10.2 Event 断线不等于 Server Run 停止
 
-SSE 是观察通道。只断开 SSE，Server 侧 Session Run 不会因此必然中断；重新连上也不会自动重发 Prompt。当前兼容 SSE 没有 cursor replay，重连只恢复后续 live event；GET hydration 可恢复 durable whole state，却无法保证补回断线窗口内尚未 whole-save 的 live-only 后缀。当前代码也不会在每次 `server.connected` 后自动执行 Session hydration。
+事件连接负责观察，不拥有 Session Run。远程 SSE 断开后，Server 端 Provider Turn 或 Tool仍可能继续；TUI 重连也不应自动重发原 Prompt，否则可能重复产生副作用。
 
-### 10.3 Interrupt 取消执行，但不撤销外部副作用
+当前兼容 `/global/event` 没有 cursor replay。SDK会重连后续 live events，Session 页面可通过 GET hydration 重读 durable whole state，但断线窗口中的 live-only delta 后缀可能无法恢复；当前代码也不会仅因每次 `server.connected` 自动执行完整 Session hydration。
 
-当前兼容 TUI 的 interrupt 最终进入 `SessionPrompt.cancel -> SessionRunState.cancel`。Processor 会尽力保存已有 Text/Reasoning，把未完成 Tool 标记为 interrupted error。
+### 10.3 Hydration 不等于 Event replay
 
-但如果命令已经启动、文件已经写入或外部 API 已经收到请求，持久化“已中断”不等于这些副作用被回滚。
+Hydration 读取“现在的 snapshot”，Event replay 按 sequence 重放“期间发生过的 durable facts”。前者能恢复最终 whole Message/Part，却不一定保留事件顺序；后者能从 cursor 续接 durable 序列，却仍不包含未落盘的 live delta。
 
-native V2 的 interrupt 会中断当前进程 coordinator 的 active owner，并结算活跃 Tool/Assistant；idle interrupt 是 no-op。它同样不能宣称跨进程取消或回滚外部副作用。
+当前 TUI 主要依赖前者。native per-session event API 提供后者，但尚未接到当前 TUI。
 
-### 10.4 Durable cursor 不等于自动 crash recovery
+### 10.4 Interrupt 不等于副作用回滚或跨进程取消
 
-durable cursor 解决“客户端从哪一个 Session Event 继续读取”。post-crash continuation 要解决的则是：
+兼容路径的 interrupt 进入 `SessionPrompt.cancel -> SessionRunState.cancel`，Processor 尽力保存已有 Text/Reasoning，并把未完成 Tool标成 interrupted error。native 路径中断当前进程 Coordinator拥有的 active Runner，idle interrupt 是 no-op。
 
-- Provider 是否已经接收请求；
-- Tool 是否已经产生副作用；
-- Tool Result 是否已经提交；
-- 哪个进程拥有当前执行；
-- 是否可以安全重试而不重复行动。
+两者都不能撤销已经执行的文件写入、命令或外部 API；native interrupt 也没有跨进程所有权协议。取消是一种停止后续工作的尽力机制，不是补偿事务。
 
-native V2 已有 durable admission 和 per-session cursor，但这些信息不足以消除 Provider/Tool 处于未知状态时的歧义。固定源码明确没有自动 startup continuation policy。
+### 10.5 Durable admission 与 cursor 不等于自动崩溃续跑
 
-## 11. 低风险观察与常见误解
+进程崩溃时可能处于多个歧义点：Provider 已收到请求但响应未提交，Tool 已产生副作用但 settlement 未完成，Runner owner 已消失但新进程不知道是否安全重试。
 
-在默认本地 TUI 提出“只读取 `Opencode_Harness/README.md` 和项目规则，先报告查看的材料，再给出学习顺序，不修改文件”，观察最终回复完成前出现的 Tool Call、状态和文本。它能帮助区分 Prompt 最终响应、实时 Event 和 durable whole state；若出现超出只读范围的 Permission 请求，应检查目标而不是机械批准。
+Durable admission 证明输入已接纳，durable cursor 证明客户端能从某个 sequence 继续读；它们没有自动解决外部副作用幂等、执行所有权和 Provider 请求重放。固定基线明确没有安全的 startup automatic continuation policy。
 
-需要避免的误解是：本地 `app.fetch` 不等于 TCP；Handler 使用 stream API 不等于 POST 在逐 token 返回；远程 `attach` 不等于 native V2；普通本地 Tool 不在 Provider 内执行；durable event 不保证当前订阅支持 replay；native API 存在不表示当前 TUI 已迁移；历史可读也不表示崩溃前工作能安全自动续跑。
+因此恢复能力应拆成五个问题：
 
-## 12. 本篇掌握要点
+```text
+请求能否重试？
+事件能否重连？
+状态能否 hydration？
+durable event 能否 cursor replay？
+执行能否在崩溃后安全续跑？
+```
 
-读完本篇，应能解释：
+回答其中一个，不能替代其余四个。
 
-1. TUI、SDK、Router、Session Orchestrator、Provider、Tool Runtime 和 Event/Persistence 是逻辑角色，不天然对应独立进程。
-2. 默认本地 TUI 使用 Worker RPC 调用内存 Router；监听模式和远程 `attach` 使用 HTTP/SSE。
-3. 当前兼容 Prompt POST 等完整 Loop 后返回最终 JSON，不是 token stream。
-4. TUI 的实时更新来自独立的 Worker RPC event 或 `/global/event` SSE。
-5. Model Provider 产生 Tool Call，普通本地 Tool 的 Permission、执行和副作用位于 OpenCode 一侧。
-6. Provider Native Adapter 只替换旧 Loop 下的 Provider 层，不等于 native V2 Session Runtime。
-7. 当前兼容 Runtime 与 native V2 在同一 executable 中并列接线；当前 TUI 仍走兼容入口。
-8. native V2 Prompt 返回 durable admission receipt，per-session API 提供 durable cursor，但当前仍缺完整 UI/parity、clustered ownership 和 post-crash continuation。
-9. 请求失败、事件断线、Interrupt 和 crash recovery 是不同边界，不能互相替代。
+## 十一、关键源码索引
 
-## 13. 关键源码入口
+正文保留的是机制所需的关键代码。继续核对时可从以下入口进入；完整证据、测试与状态边界见 [源码与证据索引](./appendices/Source_Index.md)。
 
-本文结论以 OpenCode 固定 commit `0e3474509aa5ad16afcf9c439785514d6443c6af` 为基线。行号可能随版本变化，优先按函数和导出符号查找。
+| 要回答的问题 | 关键入口 |
+| --- | --- |
+| 默认 TUI 怎样选择 Worker RPC 或 listener | `packages/opencode/src/cli/cmd/tui.ts`：`TuiThreadCommand`、`createWorkerFetch`、`createEventSource` |
+| Worker 如何调用 Router、转发事件与启动 listener | `packages/opencode/src/cli/tui/worker.ts`：`rpc.fetch`、`rpc.server`、Global Event forwarding |
+| 远程 attach 为什么使用普通 HTTP/SSE | `packages/opencode/src/cli/cmd/attach.ts`、`packages/tui/src/context/sdk.tsx` |
+| 普通 TUI 调用了哪套 Prompt API | `packages/tui/src/component/prompt/index.tsx`：`submitInner` |
+| compatibility Prompt 如何等待最终结果 | `packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts`：`SessionHttpApi.prompt` |
+| 当前 Agent Loop 在哪里 | `packages/opencode/src/session/prompt.ts`、`packages/opencode/src/session/processor.ts` |
+| Provider adapter 如何选择 | `packages/opencode/src/session/llm.ts`、`packages/opencode/src/session/llm/native-runtime.ts` |
+| 普通本地 Tool 怎样解析和执行 | `packages/opencode/src/session/tools.ts` |
+| compatibility event 与 `sync` 如何桥接 | `packages/opencode/src/event-v2-bridge.ts`、`packages/tui/src/context/event.ts` |
+| 新旧路由怎样合并 | `packages/opencode/src/server/routes/instance/httpapi/server.ts`：`createRoutes` |
+| native Prompt 如何 admission | `packages/server/src/handlers/session.ts`、`packages/core/src/session.ts`、`packages/core/src/session/input.ts` |
+| native process-local 调度在哪里 | `packages/core/src/session/execution/local.ts`、`packages/core/src/session/run-coordinator.ts` |
+| native Runner 与 Tool settlement 在哪里 | `packages/core/src/session/runner/llm.ts` |
+| native live、replay 与 history 合同 | `packages/protocol/src/groups/event.ts`、`packages/protocol/src/groups/session.ts`、`packages/server/src/handlers/session.ts` |
 
-| 主题 | 文件 | 关键符号 |
-| --- | --- | --- |
-| 默认本地 TUI transport | `packages/opencode/src/cli/cmd/tui.ts` | `TuiThreadCommand.handler`、`createWorkerFetch`、`createEventSource` |
-| Worker Router / Event | `packages/opencode/src/cli/tui/worker.ts` | `rpc.fetch`、Global event forwarding、`rpc.server` |
-| TUI Prompt 调用 | `packages/tui/src/component/prompt/index.tsx` | `submitInner()`、`session.interrupt` |
-| 远程 attach 与 TUI Event | `packages/opencode/src/cli/cmd/attach.ts`、`packages/tui/src/context/sdk.tsx` | `AttachCommand.handler`、`SDKProvider`、`startSSE` |
-| TUI reducer / hydration | `packages/tui/src/context/event.ts`、`packages/tui/src/context/sync.tsx` | `useEvent`、`SyncProvider`、`session.sync` |
-| 兼容 Prompt Handler | `packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts` | `SessionHttpApi.prompt`、`SessionHttpApi.abort` |
-| 当前 Session Runtime | `packages/opencode/src/session/prompt.ts` | `SessionPrompt.prompt`、`SessionPrompt.loop`、`SessionPrompt.cancel` |
-| Provider 默认与 Adapter | `packages/opencode/src/session/llm.ts`、`packages/opencode/src/session/llm/native-runtime.ts` | `LLM.run`、`LLM.stream`、`LLMNativeRuntime.stream` |
-| Tool dispatch | `packages/opencode/src/session/tools.ts` | `SessionTools.resolve` |
-| Event bridge / SSE | `packages/opencode/src/event-v2-bridge.ts`、`packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts` | `EventV2Bridge`、`eventResponse` |
-| 新旧 Router 组合 | `packages/opencode/src/server/routes/instance/httpapi/server.ts` | `serverRoutes`、`createRoutes` |
-| native Prompt contract | `packages/protocol/src/groups/session.ts` | `session.prompt`、Session event/history endpoints |
-| native Handler | `packages/server/src/handlers/session.ts` | `session.prompt`、`session.events`、`session.interrupt` |
-| durable admission | `packages/core/src/session.ts`、`packages/core/src/session/input.ts` | `V2Session.prompt`、`SessionInput.admit`、promotion functions |
-| process-local execution | `packages/core/src/session/execution/local.ts`、`packages/core/src/session/run-coordinator.ts` | `SessionExecutionLocal`、`SessionRunCoordinator.make` |
-| native Runner | `packages/core/src/session/runner/llm.ts` | `runTurnAttempt`、`SessionRunner.run` |
-| 迁移状态 | `specs/v2/session.md`、`specs/v2/provider-model.md`、`specs/v2/todo.md` | Session parity、Provider adaptation、deferred recovery |
+## 十二、总结：边界必须沿完整调用链判断
 
-至此，主系列已经从 Agent Loop 内部一路走到实际运行边界：模型负责判断，Harness 负责组织和约束，Tool Runtime 负责行动，Session/Event 保存并传递状态，而 Client 通过适合当前拓扑的请求和事件通道观察整个过程。
+Runtime Boundary 不能靠一个模块名、一个 URL 或一个 `native` 开关判断。逻辑角色说明谁负责什么，Worker 与进程边界说明代码在哪个执行上下文，网络边界说明数据是否真正跨 socket；三者需要分别核对。
+
+当前默认本地 TUI 把 Prompt 通过 Worker RPC 送入同一 executable 的兼容 Router，进入 `SessionHttpApi.prompt -> SessionPrompt`；普通 Tool 在 OpenCode 一侧执行，Provider 通过自己的 transport 连接模型；Prompt POST 等待最终 Assistant，而运行过程经 EventV2、Bridge、GlobalBus 和独立 RPC event 更新 TUI。监听模式和远程 `attach` 只替换 Client/Server transport，不自动改变 Session Runtime。
+
+`OPENCODE_EXPERIMENTAL_NATIVE_LLM` 只替换旧 Loop 内的 Provider adapter。真正的 native V2 使用另一套 `/api/session/:id/prompt` 合同，把 durable admission 与 process-local execution 分离，并提供独立 live 与 durable cursor API；它已经可达，却尚未完成当前 TUI 与全部 V1 parity。请求失败、事件断线、hydration、interrupt 和崩溃恢复也各自属于不同边界，不能用“状态已持久化”一笔带过。
+
+至此，06-12 的 Harness 主线可以合成一张完整地图：Client提交目标，Harness选择 Agent并组织 Context与 Loop，Model提出下一步，Tool Runtime执行被允许的行动，Session/Event保存和传播状态，必要时父子 Session分工，而 Runtime Boundary决定这些责任如何跨模块、Worker、网络和恢复合同连接起来。

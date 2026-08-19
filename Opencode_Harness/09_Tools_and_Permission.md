@@ -1,40 +1,25 @@
 # Tools 与 Permission：模型的意图怎样变成真实操作
 
-上一篇：[08 Context Architecture](./08_Context_Architecture.md)
-下一篇：[10 Session 与 Persistence](./10_Session_and_Persistence.md)
+上一篇：[08 Context Architecture](./08_Context_Architecture.md) ｜ 下一篇：[10 Session 与 Persistence](./10_Session_and_Persistence.md)
 
 > 源码基线：`0e3474509aa5ad16afcf9c439785514d6443c6af`
-
-## 1. 学习问题
 
 假设你刚开始学习 Harness，并向 OpenCode 提出：
 
 > 请先读取这个教程的 README 和项目规则，再告诉我应该按什么顺序学习。
 
-模型随后生成了一个 `read` 调用。此时文件已经被读取了吗？谁检查路径和参数？如果读取需要批准，谁会暂停执行？结果又怎样回到下一轮模型输入？
+模型随后生成了一个 `read` 调用。此时文件已经被读取了吗？如果路径写错，谁会阻止执行？如果需要批准，谁会暂停等待？读取结果又怎样回到模型面前？
 
-本篇只回答一个问题：
+直观答案是：模型没有直接操作文件。它只生成了一个结构化的行动请求；Harness 随后负责检查参数和权限，调用真正的执行器，再把结果保存并放回下一轮上下文。整条链的中心区别是：**Tool Call 表达“希望执行什么”，不是“已经发生了什么”。**
 
-> **模型提出的行动意图，怎样经过 Harness 变成一次真实、可控、可记录的操作？**
+## 一、一次 `read` 是怎样从意图走到结果的
 
-## 2. 最短答案
-
-模型不会直接读取文件。它只能根据本轮看到的工具名称、说明和参数结构，生成一个工具调用（Tool Call）。
-
-OpenCode 随后负责找到对应实现、验证参数、执行权限判断，并在允许后调用真正的工具执行器（Tool Executor）。执行结果还要经过工具结算（Tool Settlement），成为可保存的终态和下一轮模型可见的工具输出。
-
-因此，`Tool Call` 的准确含义是“请求执行”，不是“已经执行”。
-
-## 3. 最小心智模型
-
-阅读下面这条链时，重点观察三个边界：模型只提出意图，Harness 执行确定性检查，工具才接触真实环境。
+先把一次工具调用放回完整反馈循环：模型根据 Context 选择行动，Harness 把行动变成受控操作，工具执行结果成为下一轮 Observation。
 
 ```text
 候选 Tool 注册
     ↓
 本轮物化 Tool definition
-    ↓
-模型看到 name / description / input schema
     ↓
 模型生成 Tool Call
     ↓
@@ -44,56 +29,53 @@ Permission：allow / ask / deny
     ↓
 Tool Executor 真实执行
     ↓
-domain/raw Tool Result
-    ↓
 Tool Settlement
     ↓
-durable terminal state + Model Tool Output
-    ↓
-下一轮模型观察结果
+保存终态，并在下一轮形成 Observation
 ```
 
-这条链同时包含概率性和确定性两类行为：
+这不是七个并列模块，而是同一次调用的七个阶段。前一阶段的输出是后一阶段的输入；特别是参数验证或 Permission 没有通过时，后面的真实操作就不应开始。
 
-- 模型是否选择 `read`、先读哪个文件，是概率性判断。
-- schema 校验、规则求值、用户批准、执行器调用和结果保存，是 Harness 的控制流程。
+本篇会一直使用同一个低风险任务观察它：用户希望从零学习 Harness，OpenCode 先读取 `Opencode_Harness/README.md`，再根据其中的导航决定是否读取项目规则，最后推荐学习顺序。选择 `read` 是因为它不主动修改教程文件，但“只读”并不等于“不需要控制”——项目外路径同样可能包含敏感信息。
 
-## 4. 先分清五个容易混淆的概念
+这条流程中混合了两种性质不同的工作。模型对“现在是否需要读文件、先读哪个文件”做概率性判断；schema 校验、规则求值、批准等待、executor 调用和结果落库则由 Harness 按程序规则推进。前者让 Agent 能适应开放任务，后者让一次具体操作具备可检查边界。
 
-| 概念 | 本篇中的含义 | 不等于 |
-| --- | --- | --- |
-| Tool | 向模型声明的具名能力；本地 Tool 还关联执行器 | Tool 已经可见或已经执行 |
-| Tool definition | 本轮发给模型的名称、说明和输入 schema | JavaScript/Effect 执行器本身 |
-| Tool Call | 模型生成的调用名称、ID 和参数 | Tool Result |
-| Tool Result | 执行器或 Provider 产生的原始领域结果 | 已完成持久化的终态 |
-| Tool Settlement | Harness 把一次调用确定为成功、可见失败或中断，并形成模型输出和持久化状态的过程 | 只调用了一次 `execute()` |
+为了看懂这条链，先区分五个名称：
 
-为了强调结果经过了投影，本篇还使用“模型工具输出（Model Tool Output）”表示最终回放给模型的内容。它可能经过格式转换、截断或错误归一化，不一定等于执行器最初返回的完整对象。
+- **Tool** 是 OpenCode 向模型提供的具名能力，本地 Tool 还关联实际执行器。
+- **Tool definition** 是本轮发送给模型的名称、说明和输入 schema，不包含执行器代码。
+- **Tool Call** 是模型生成的工具名、调用 ID 和参数。
+- **Tool Result** 是执行器或 Provider 产生的领域结果。
+- **Tool Settlement** 是 Harness 把调用确定为成功、可见失败或中断，并形成持久化终态与模型输出的过程。
 
-## 5. 贯穿场景：先读取 Harness 学习入口
+执行器返回的原始结果、Session 保存的结果和下一轮模型看到的工具输出可能是三种不同表示。模型输出可能经过格式转换、截断或错误归一化，不能把这几个名称混为一谈。
 
-下面使用一个低风险场景贯穿本篇。路径仅作示例：
+### 1.1 注册：系统先建立候选能力
 
-```text
-用户目标：从零学习 OpenCode Harness
-第一步：读取示例项目中的 Opencode_Harness/README.md
-第二步：读取项目规则，确认学习范围
-第三步：根据读取结果推荐章节顺序
+#### 1.1.1 `ReadTool` 同时声明机器合同与执行入口
+
+当前默认路径中，`ReadTool` 通过 `Tool.define("read", ...)` 声明工具名称、输入 schema 和执行函数。`ToolRegistry` 初始化时把它加入候选集合。
+
+固定源码中的定义可以压缩为：
+
+```ts
+export const Parameters = Schema.Struct({
+  filePath: Schema.String,
+  offset: Schema.optional(NonNegativeInt),
+  limit: Schema.optional(NonNegativeInt),
+})
+
+export const ReadTool = Tool.define(
+  "read",
+  Effect.gen(function* () {
+    // 初始化依赖，最后返回 description、parameters 与 execute
+  }),
+)
 ```
 
-这个场景适合观察工具生命周期，因为 `read` 主要取得信息，不主动修改教程文件。即便如此，Harness 仍然不能跳过参数和 Permission 检查：读取项目之外的路径也可能暴露敏感信息。
+`Tool.define` 保存的不是一段给模型阅读的 Prompt，而是一份宿主侧定义：它把公开说明、参数 decoder 和真实 executor 关联在同一个 Tool identity 下。之后 Registry 可以把其中的说明与 schema 发给模型，同时把 executor 留在 OpenCode 运行时。
 
-### 5.1 注册：OpenCode 先知道有哪些候选能力
-
-当前默认路径中，`ReadTool` 通过 `Tool.define("read", ...)` 声明：
-
-- 工具名称和说明；
-- 输入参数 schema；
-- 真正执行读取的函数。
-
-`ToolRegistry` 初始化时把它加入 Built-in 候选集合。此时发生的只是“OpenCode 具备这种能力”，还没有形成模型请求，更没有读取文件。
-
-`read` 的主要输入可以简化为：
+`read` 的输入可以简化为：
 
 ```text
 filePath：要读取的路径，必需
@@ -101,14 +83,33 @@ offset：从哪一行开始，可选
 limit：最多读取多少行，可选
 ```
 
-注册和执行分开很重要。一个工具可以存在于 Registry 中，却因为当前 Agent、Model 或配置而不出现在本轮请求里。
+注册时没有模型请求，也没有文件读取。把注册与执行分开后，系统可以安装很多能力，却只在合适的 Agent、Model 和会话中公开其中一部分。
 
-### 5.2 物化：本轮究竟向模型公开哪些 Tool
+#### 1.1.2 候选来源不同，信任边界也不同
 
-外层 Loop 为新的 Assistant/Processor 上下文组装首次 Provider Request 时，`SessionTools.resolve` 会重新取得候选 Tool，并把它们转换成本轮可调用的 Tool map。Retry attempt 复用同一份 `streamInput`，不会先回到这里重新物化。
+Built-in、Custom Tool、Plugin 和 MCP 的差别首先体现在候选能力从哪里来：Built-in 由 OpenCode 静态注册；Custom Tool 从配置目录发现并加载；Plugin 可以提供 Tool 和 Hook；MCP Tool 来自 Server 的 `tools/list`。其中 MCP Tool 不会先塞进旧 `ToolRegistry`，而是由 `SessionTools.resolve` 在 Registry Tool 之外取得并转换；两条来源在本轮 Tool map 中汇合。Skill 则由内置 `skill` Tool 加载说明，说明本身不会因为包含命令就自动执行；`task` Tool 会创建或恢复子 Session，它属于编排能力，不是普通叶子函数，详见 [第 11 篇](./11_Agent_Specialization_and_Collaboration.md)。安装和配置这些扩展的方法参见 [05 Enhancement](./05_Enhancement.md)。
+
+这些入口最终都可能产生可调用能力，但信任边界不同。Custom/Plugin 代码运行在 OpenCode 进程中，MCP 的执行者可能是本地或远程 Server；“都能以 Tool 形式出现在模型面前”不等于“都由同一个受控执行器完成”。
+
+把候选来源放在注册阶段下比较，会更容易看清这种差异：
+
+| 候选能力 | 怎样进入体系 | 实际执行者 | 此时要审查什么 |
+| --- | --- | --- | --- |
+| Built-in Tool | OpenCode Registry 静态注册 | OpenCode 内部 executor | leaf 是否在副作用前正确请求 Permission |
+| Custom Tool | 从配置目录发现并动态加载 | 自定义模块代码 | Host 不会自动替它补一次 `ctx.ask` |
+| Plugin Tool | Plugin 加载后提供 Tool/Hook | Plugin 进程内代码 | Plugin 加载本身已获得进程能力 |
+| MCP Tool | 连接 Server，取得并缓存 `tools/list` | 本地或远程 MCP Server | schema、说明、结果和远端权限都属于外部边界 |
+
+这张表比较的是“能力从哪里进入”，不是后续执行顺序。无论来源如何，只要要交给模型选择，仍需在本轮被物化成 Tool definition。
+
+### 1.2 物化：决定模型本轮看见什么
+
+#### 1.2.1 `SessionTools.resolve` 把定义包装成本轮 Tool map
+
+外层 Loop 为新的 Assistant/Processor 上下文组装首次 Provider Request 时，`SessionTools.resolve` 重新取得候选 Tool，并形成这一轮的 Tool map。一次 Retry attempt 复用同一份 `streamInput`，不会先返回这里重新物化。
 
 ```text
-Registry Tool
+Registry 候选
 -> 生成 JSON Schema
 -> 做 Provider 兼容转换
 -> 应用 Agent / Session / 本轮覆盖规则
@@ -116,38 +117,53 @@ Registry Tool
 -> 放入 Provider Request
 ```
 
-这里需要区分两种控制：
+核心包装关系如下：
 
-1. **可见性控制**：决定模型本轮能不能看到整个 Tool。
-2. **资源级授权**：模型给出具体路径或命令后，决定这次调用能不能执行。
-
-例如，whole-tool deny 可以让本轮模型看不到 `bash`；但模型能看到 `read`，不表示任意路径都已被允许。具体路径仍要等执行器调用 Permission。
-
-这也解释了为什么工具 definition 属于 Context Architecture 的一部分：名称、说明和 schema 会影响模型如何选择行动。但 Tool 的真实执行和授权属于本篇。
-
-### 5.3 模型看到 schema，看不到 executor
-
-Provider 通常只接收：
-
-```text
-name: read
-description: 这个工具适合做什么
-input schema: filePath / offset / limit 的结构与约束
+```ts
+for (const item of yield* registry.tools({ modelID, providerID, agent, permission })) {
+  const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
+  tools[item.id] = tool({
+    description: item.description,
+    inputSchema: jsonSchema(schema),
+    execute(args, options) {
+      return run.promise(/* Hook -> item.execute -> output */)
+    },
+  })
+}
 ```
 
-模型看不到：
+这里的“物化”不是重新安装 Tool，而是把候选定义与当前 Session、Assistant Message、Agent、Model、Abort Signal 和 Permission context 绑定，形成这一轮可执行的 Tool map。
 
-- OpenCode 的文件系统对象；
-- `ctx.ask` 的实现；
-- Permission 的待处理请求；
-- Tool Executor 的 TypeScript/Effect 代码；
-- OpenCode 进程在操作系统中的真实权限。
+#### 1.2.2 可见性过滤发生在最终请求边界
 
-所以模型能够生成“读取 `Opencode_Harness/README.md`”的结构化意图，却不能从 Provider 进程直接调用本机 `fs.readFile`。
+最终请求还会根据 Agent permission、Session permission 与本次 User Message 的 tool override 过滤：
 
-### 5.4 Tool Call：这是行动请求，不是行动事实
+```ts
+function resolveTools(input) {
+  const disabled = Permission.disabled(
+    Object.keys(input.tools),
+    Permission.merge(input.agent.permission, input.permission ?? []),
+  )
+  return Record.filter(
+    input.tools,
+    (_, name) => input.user.tools?.[name] !== false && !disabled.has(name),
+  )
+}
+```
 
-模型可能生成如下说明性调用：
+只有 whole-tool 的 `pattern: "*"` deny 才会直接隐藏对应 Tool；针对某个路径、命令或 URL 的资源级规则，通常要等 executor 调用 `ctx.ask` 时才求值。把这两种过滤混在一起，会误以为“模型看得见”就等于“具体资源已获准”。
+
+#### 1.2.3 模型看到合同，看不到实现能力
+
+Provider 通常只接收 `name`、`description` 和 `input schema`。模型看不到 Tool Executor 的 TypeScript/Effect 代码、`ctx.ask` 的实现、OpenCode 的文件系统对象，也不知道进程在操作系统中实际拥有多大权限。
+
+因此，“Registry 里存在 `read`”和“模型本轮看见 `read`”是两个结论。前者描述候选能力，后者描述 Context。Agent 或本轮覆盖规则可以让整个 Tool 不进入请求；但只要 definition 被公开，模型就可能据此生成调用。
+
+definition 的文字也会影响模型行为。名称告诉模型调用哪个入口，description 解释何时使用，schema 则限制参数结构；三者共同属于 Provider Request 的 Context。executor 却必须留在 Harness 侧，因为把实现代码写进 prompt 既不能赋予模型本地能力，也不能替代真实的参数检查与权限控制。
+
+### 1.3 Tool Call：结构化意图还不是行动事实
+
+模型可能输出下面这种说明性调用：
 
 ```json
 {
@@ -160,280 +176,291 @@ input schema: filePath / offset / limit 的结构与约束
 }
 ```
 
-不同 Provider 的线上协议格式可能不同。OpenCode 会把流式响应归一化成包含调用 ID、工具名称和输入参数的内部事件。
+不同 Provider 的线上协议可能不同，OpenCode 会把流式响应归一化成内部事件。到这里为止，教程文件仍未被 `read` executor 读取。
 
-到这个节点为止，教程文件仍然没有被 `read` executor 读取。后面至少还有参数验证和授权。
+这是模型与 Harness 的责任分界：模型用概率性判断决定是否调用、调用哪个 Tool、先读取哪个文件；Harness 不把这份输出当成可信指令，而是把它当作等待验证的数据。
 
-### 5.5 验证：参数先满足机器可检查的合同
+### 1.4 验证与 Hook：执行前先收窄输入
 
-当前普通 Built-in Tool 的输入会经过不止一层检查：
+#### 1.4.1 参数验证至少跨过两层合同
 
-1. AI SDK 根据发给模型的 input schema 检查调用参数。
-2. `Tool.wrap` 使用原始 Effect Schema 再做 typed decode。
+普通 Built-in Tool 的输入会经过不止一层检查：AI SDK 根据发送给模型的 input schema 校验调用参数，`Tool.wrap` 再使用原始 Effect Schema 做 typed decode。缺少 `filePath`，或把 `offset` 写成非法值时，执行器不会因为参数来自模型就直接接受。
 
-如果 `offset` 是非法值，或缺少必需的 `filePath`，执行器不会因为“这是模型生成的参数”就直接接受。验证失败会进入错误路径，真实读取不会开始。
+`Tool.wrap` 中的 typed decode 位于 leaf executor 之前：
 
-schema 解决的是“参数形状是否有效”，不是“用户是否允许访问这个资源”。后一项由 Permission 负责。
+```ts
+const decode = Schema.decodeUnknownEffect(toolInfo.parameters)
+const execute = toolInfo.execute
 
-### 5.6 Hook 与执行顺序
+toolInfo.execute = (args, ctx) =>
+  Effect.gen(function* () {
+    const decoded = yield* decode(args).pipe(
+      Effect.mapError((error) => new InvalidArgumentsError({ tool: id, detail: String(error) })),
+    )
+    return yield* execute(decoded, ctx)
+  })
+```
 
-对当前默认路径中的普通 Registry Tool，主顺序可以简化为：
+schema 只回答“参数的结构和类型是否合法”，不回答“这个合法路径是否允许读取”。即使 `filePath` 是完全有效的字符串，它仍可能指向项目外的敏感文件；资源授权必须在下一阶段处理。
+
+验证失败时，真实读取不会开始，调用会沿错误路径被结算。反过来，通过验证也只说明数据满足机器合同：schema 无法判断教程路径是否符合用户意图，无法判断文件内容是否敏感，也无法判断远程 MCP Server 是否值得信任。这正是为什么验证后还需要 Permission，而 Permission 之外还需要操作系统与部署边界。
+
+#### 1.4.2 Hook 位于验证、授权和输出处理之间
+
+Plugin Hook 也位于这条执行链中。当前默认普通 Registry Tool 的主要顺序可以简化为：
 
 ```text
 AI SDK input validation
 -> tool.execute.before
 -> Built-in typed decode
--> leaf executor 调用 ctx.ask
+-> leaf executor 内调用 ctx.ask
 -> 真实执行
 -> 通用输出处理
 -> tool.execute.after
 -> 返回 LLM Runtime
 ```
 
-`before` hook 可以在 Tool 执行前检查或修改参数。因此，受管 Built-in 应当对最终实际使用的路径、命令或 URL 求 Permission，而不能只授权模型最初生成但后来已改变的值。
+`before` hook 可以检查或修改参数，所以受管 Built-in 应对最终实际使用的路径、命令或 URL 请求 Permission，而不能只批准修改前的值。`after` hook 又可以修改结果；固定源码中，它位于普通 Tool 的通用文本截断之后，之后没有再做同一层通用截断。因此 Hook 是需要信任的进程内扩展，而不是天然受 Tool wrapper 完整约束的脚本。
 
-`after` hook 可以修改执行结果。固定源码中，普通 Registry Tool 的 `after` 位于通用文本截断之后，之后没有再做同一层通用截断。这是一个需要信任 Plugin 代码的实现边界：不能假设 Hook 修改后的输出仍一定满足之前的截断 metadata。
+MCP Tool 的后半段顺序不同：Host 先运行 `before`，再请求 namespaced MCP Permission、调用 Server，然后让 `after` 处理 Server 返回的原始结果，最后才由 Host 转换文本/附件并做 MCP 输出限制。因此“after 位于通用截断之后”的缺口只适用于普通 Registry Tool，不能不加区分地套到 MCP adapter。
 
-### 5.7 Permission：在副作用之前做确定性决策
+### 1.5 Permission：在副作用前决定是否继续
 
-当前默认 Permission 规则可以理解为：
+#### 1.5.1 规则求值采用最后匹配，缺省为 `ask`
+
+当 `read` executor 准备访问具体路径时，它会通过 `ctx.ask` 请求资源级授权。规则求值可以理解为：
 
 ```text
 permission + pattern -> allow | ask | deny
 ```
 
-执行器把具体 action/resource 交给 `ctx.ask` 后，主要有三种结果：
+- `allow`：无需交互，继续执行。
+- `ask`：发布批准请求并暂停，用户回复前不读取。
+- `deny`：立即拒绝，文件不会被读取。
 
-| 结果 | Harness 的行为 | 文件是否读取 |
-| --- | --- | --- |
-| `allow` | 直接继续 | 随后读取 |
-| `ask` | 发布批准请求并等待用户 | 批准前不读取 |
-| `deny` | 立即拒绝调用 | 不读取 |
+没有匹配规则时，当前规则求值默认进入 `ask`。多条规则命中时，最后一条匹配规则优先；Session rules 位于 Agent rules 之后，因此可能覆盖前面的匹配结果。
 
-没有匹配规则时，当前规则求值默认进入 `ask`。如果多条规则匹配，最后一条匹配规则优先；Session rules 位于 Agent rules 之后，因此可能覆盖前面的匹配结果。
+固定源码直接使用 `findLast`：
 
-当用户看到批准请求时，常见回复语义是：
+```ts
+export function evaluate(permission, pattern, ...rulesets) {
+  return rulesets
+    .flat()
+    .findLast(
+      (rule) => Wildcard.match(permission, rule.permission) &&
+                Wildcard.match(pattern, rule.pattern),
+    ) ?? { action: "ask", permission, pattern: "*" }
+}
+```
 
-- `once`：只允许当前请求。
-- `always`：在当前 OpenCode Instance 的内存批准集中加入相应 pattern。
-- `reject`：拒绝当前请求，并结束相关等待。
+因此规则顺序本身具有语义。后出现的、更具体或来自 Session 的匹配规则可以覆盖前面的结果，但只有真正同时匹配 permission 与 pattern 的规则才参与决策。
 
-当前默认旧路径中的 pending request 和 `always` approval 是进程内状态。`always` 可能在同一 Instance 的其他 Session 中生效，但不能据此认为它会跨进程重启持久保存。
+#### 1.5.2 `ask` 会建立等待点，而不是先执行后通知
 
-### 5.8 `read` 真正接触文件系统
+`Permission.ask` 会逐个检查本次请求的 patterns：任一 pattern 命中 deny 就立即失败；全部 allow 就直接返回；至少一个 ask 才创建请求并等待：
 
-Permission 允许后，`read` executor 才进行真实操作：
+```ts
+const deferred = yield* Deferred.make()
+pending.set(id, { info, deferred })
+yield* events.publish(Event.Asked, info)
+return yield* Effect.ensuring(
+  Deferred.await(deferred),
+  Effect.sync(() => pending.delete(id)),
+)
+```
 
-1. 按当前项目目录解析相对路径。
-2. 对项目外路径先处理 `external_directory` 授权。
-3. 对最终读取资源处理 `read` 授权。
-4. 读取目录、文本、图片或 PDF。
-5. 对文本分页，对媒体生成相应附件表示。
+executor 的 Effect 停在 `Deferred.await`，所以批准发生在后续文件读取、命令启动或远程调用之前。这是 Permission 能够约束受管 Tool 的关键前提。
+
+#### 1.5.3 `once`、`always` 与 `reject` 的生命周期不同
+
+用户面对批准请求时，`once` 只允许当前请求；`always` 把相应 pattern 加入当前 OpenCode Instance 的内存批准集合；`reject` 拒绝请求并结束相关等待。这里的 `always` 不是“永久写入配置”：固定版本当前默认兼容路径中的 pending request 和 approval 都是进程内状态，不能据此推断它们会跨进程重启保存。
+
+内存中的 `always` approval 可能在同一 Instance 的其他 Session 中匹配，这比“只对当前对话有效”更宽；但进程退出后并不保证继续存在。批准时真正需要阅读的是具体 permission、pattern 和将要访问的资源，而不是只看模型在文本中如何描述自己的计划。
+
+### 1.6 Executor：此时才接触真实文件系统
+
+#### 1.6.1 `read` 先解析最终资源，再依次经过两个授权面
+
+Permission 允许后，`read` executor 才会：
+
+1. 按当前项目目录解析相对路径；
+2. 对项目外路径处理 `external_directory` 授权；
+3. 对最终资源处理 `read` 授权；
+4. 读取目录、文本、图片或 PDF；
+5. 对文本分页，对媒体生成附件表示；
 6. 返回标题、文本、metadata 和可选 attachments。
 
-当前实现对文本默认按 2000 行和 50 KiB 形成一页。超过范围时，不代表整个文件消失；下一步可以用新的 `offset` 继续读取。
+源码中的顺序尤其值得注意：
 
-回到贯穿场景，模型第一轮只读到 README 的学习地图。如果 README 指向项目规则，模型可在下一轮再生成另一个 `read` Tool Call，而不是要求一次调用吞下整个项目。
+```ts
+if (!path.isAbsolute(filepath)) {
+  filepath = path.resolve(instance.directory, filepath)
+}
 
-### 5.9 Tool Result 还要经过 Settlement
+yield* assertExternalDirectoryEffect(ctx, filepath, { kind })
+yield* ctx.ask({
+  permission: "read",
+  patterns: [path.relative(instance.worktree, filepath)],
+  always: ["*"],
+})
 
-executor 返回的 domain/raw Tool Result 不是生命周期终点。OpenCode 还需要把调用状态从 pending、running 结算为 completed 或 error。
+// 授权通过后才进入目录、媒体、文本等读取分支
+```
 
-当前 `SessionProcessor` 处理的核心状态可以简化为：
+`external_directory` 回答“是否允许越出工作树”，`read` 回答“是否允许读取这个最终资源”。二者都通过之后，真实内容访问才继续。
+
+#### 1.6.2 目录、文本和媒体走不同结果分支
+
+文本默认按 2000 行和 50 KiB 形成一页。超出范围不是错误，也不意味着 OpenCode 已经把整个文件全部发给模型；模型可以在下一轮使用新的 `offset` 请求后续内容。这个限制既控制工具工作量，也避免单次结果占满模型上下文。
+
+目录返回经过 offset/limit 切片的 entries；文本逐行读取并限制单行长度、总字节和页大小；受支持的图片与 PDF 作为 attachments 返回；其他二进制文件会失败。`read` 还可能通过 `Instruction.resolve` 把附近规则附加为 `<system-reminder>`，因此一次读取结果可以同时包含文件正文与该路径适用的规则提醒。
+
+这里的 50 KiB 是 `read` producer 自己的分页边界。`read` 返回的 metadata 已经说明是否截断，外层普通 Tool wrapper 不会再把它误当成一个尚未处理的无限文本；要继续读取的来源仍是原文件和新的 `offset`，不是某个自动保存了全文的模型附件。
+
+#### 1.6.3 并非所有 Tool 都由本地 leaf executor 执行
+
+不同能力在这一阶段由不同执行者完成。Built-in Tool 调用 OpenCode 内部 executor；MCP Tool 由 Host 对 namespaced Tool 请求 Permission 后，把调用交给本地或远程 MCP Server；Provider 托管的 `providerExecuted` Tool 则由 Provider 产生结果，OpenCode 不会再寻找同名本地 executor。后两类仍需要结果结算，但不能机械套用“本地 leaf executor 在函数内部请求资源 Permission”的流程。
+
+### 1.7 Settlement：把执行结果变成下一轮 Observation
+
+#### 1.7.1 Tool Part 是一条显式状态机
+
+executor 返回并不是生命周期终点。`SessionProcessor` 还要把 Tool Part 从 `pending`、`running` 结算为 `completed` 或 `error`：
 
 ```text
-tool input -> pending
-tool call  -> running
+tool input          -> pending
+tool call           -> running
 tool result success -> completed
 tool result failure -> error
 ```
 
-成功终态会保存输入、模型可见输出、标题、时间、metadata 和可选附件；失败终态会保存输入、错误和相关 metadata。第 10 篇会继续解释这些状态如何成为 durable Message/Part。
+成功结算会把输入沿用到终态，并补上 output、title、metadata、时间和附件：
 
-### 5.10 下一轮：结果重新成为 Observation
-
-完成 Tool Settlement 后，外层 Agent Loop 不会假设模型“自动知道”文件内容。它会重新读取会话历史，把 completed/error Tool Part 投影成模型可接受的工具输出，再创建新的 Provider Request。
-
-```text
-第一轮：模型决定读取 README
--> Harness 执行 read
--> 保存 Tool terminal state
-
-第二轮：模型看到 README 的 Model Tool Output
--> 判断还需读取项目规则
--> 生成新的 Tool Call，或给出学习路线
+```ts
+yield* session.updatePart({
+  ...match.part,
+  state: {
+    status: "completed",
+    input: match.part.state.input,
+    output: output.output,
+    metadata: output.metadata,
+    title: output.title,
+    time: { start: match.part.state.time.start, end: Date.now() },
+    attachments: output.attachments,
+  },
+})
 ```
 
-这就是 `Think -> Act -> Observe` 中的 Observe：不是模型在调用之间保留了内部记忆，而是 Harness 把工具结果放回下一轮上下文。
+成功终态会保存输入、模型可见输出、标题、时间、metadata 和可选附件；失败终态会保存输入、错误及相关 metadata。参数错误、文件不存在、MCP 错误或用户拒绝因此都可以成为后续模型可观察的终态，而不是留下一个永远等待的调用。
 
-## 6. Tool 可见性与 Permission 是两层控制
+#### 1.7.2 Raw Result、durable terminal state 与模型输出是三层表示
 
-下面这张表可以用于快速排查“为什么工具没运行”：
+工具输出并非越完整越好。`read` 自己分页，`bash` 保留受限预览并可能把更完整的结果写入受管理文件，普通 Tool wrapper 会截断文本，MCP adapter 也会转换与限制结果；更早的输出还可能在 Compaction/Pruning 后不再对模型可见。文本大小限制也不能代替附件的 MIME 与大小检查。
 
-| 阶段 | 问题 | 失败时的表现 |
+因此需要分别问三个问题：executor 实际获得了什么，Session 终态保存了什么，下一 Provider Turn 又投影了什么。假设 `read` 遇到一个超长 README，执行器可能只按当前 `offset/limit` 返回一页；wrapper 还可能处理文本边界；未来 Compaction 又可能让旧输出从 active history 中消失。不能因为最初文件很完整，就推断模型始终拥有其全部内容。
+
+普通 Registry Tool 的通用文本截断发生在 Tool wrapper 内，而 `tool.execute.after` 位于 wrapper 返回之后。after hook 可以修改已经截断的 output，固定路径没有再经过同一层通用截断；因此 Plugin Hook 是受信的进程内扩展，不能把通用 truncation 当作对所有扩展输出的最终安全闸门。Attachments 也有独立 MIME、大小和 Provider 兼容边界，不应只用文本字符数衡量。
+
+#### 1.7.3 下一轮把终态投影成 Observation
+
+结算完成后，外层 Agent Loop 重新读取会话历史，把 completed/error Tool Part 投影成 Provider 可接受的工具输出：
+
+```text
+Provider Turn 1：模型请求读取 README
+-> Harness 执行并保存 Tool terminal state
+
+Provider Turn 2：模型看到 README 的 Model Tool Output
+-> 决定继续读取项目规则，或给出学习顺序
+```
+
+模型不会在调用之间自动记住 README。Observe 能够成立，是因为 Harness 保存结果并在下一轮重新注入。Tool Part 如何持久化由 [第 10 篇](./10_Session_and_Persistence.md)继续说明。
+
+## 二、Permission 控制调用，但不是系统的最终安全边界
+
+### 2.1 Tool 可见性、资源授权与 OS 隔离是三个控制面
+
+理解 `read` 生命周期后，可以把三个经常混淆的控制面放到正确位置：
+
+```text
+Tool 可见性：模型本轮能否提出这种行动？
+        ↓
+Permission：这次具体资源访问是否继续？
+        ↓
+OS Sandbox：即使代码尝试越界，系统最多允许它做什么？
+```
+
+Tool 可见性和 Permission 是两层不同控制。把 `bash` 从 Tool map 中移除，模型就不能通过这份 definition 发起普通 `bash` Tool Call；但模型能看见 `read`，不表示任意路径已被允许，具体资源仍要由 executor 请求 Permission。
+
+三层控制解决的问题不同：可见性缩小模型能够提出的受管能力集合；Permission 对某次 action/resource 求值并在必要时等待用户；OS Sandbox 即使面对有缺陷或不受管的代码，也从系统层限制进程实际能触及的文件、网络和子进程。
+
+### 2.2 生命周期定位比反复修改 Prompt 更可靠
+
+遇到“Tool 没有运行”时，可以沿同一生命周期定位，而不是只修改 prompt：
+
+| 观察位置 | 要问的问题 | 未通过时的典型表现 |
 | --- | --- | --- |
-| Registry | OpenCode 是否发现了这个 Tool？ | 候选集中不存在 |
-| Materialization | 当前 Agent/Model 是否允许公开它？ | Provider Request 没有 definition |
-| Model decision | 模型是否选择调用它？ | 只生成文本或选择别的 Tool |
-| Validation | 参数是否满足 schema？ | executor 不运行 |
-| Permission | 具体资源是否允许？ | ask 等待或 deny |
-| Execution | 外部操作是否成功？ | error Tool state |
-| Settlement | 结果是否成功投影和保存？ | 下一轮缺少可用 Observation |
+| Registry | OpenCode 是否发现候选 Tool | 候选集中不存在 |
+| Materialization | 本轮是否公开 definition | Provider Request 中没有该 Tool |
+| Model decision | 模型是否选择调用 | 只输出文本或调用别的 Tool |
+| Validation | 参数是否满足 schema | executor 不启动，调用进入错误路径 |
+| Permission | 具体资源是否允许 | 等待批准或直接 deny |
+| Execution | 外部操作是否成功 | 形成 error Tool state |
+| Settlement | 结果是否保存并投影 | 下一轮缺少可用 Observation |
 
-“Tool 没有出现在模型面前”和“Tool 调用被 Permission 拒绝”发生在不同阶段，也有不同的调试方法。
+这些问题有严格先后关系。例如 Permission 规则无法解释“definition 根本没有发给模型”，反复要求模型重试也无法修复一个不合法的参数 schema。
 
-## 7. 不同能力怎样进入 Tool 体系
+### 2.3 Permission 不会自动创建 OS Sandbox
 
-| 类型 | 怎样进入当前调用体系 | 主要执行者 | 需要注意的信任边界 |
-| --- | --- | --- | --- |
-| Built-in Tool | OpenCode Registry 静态注册，并在外层 Loop 新一轮物化 | OpenCode 内部 executor | leaf 必须在副作用前正确调用 Permission |
-| Custom Tool | 从配置目录发现并动态载入 | 自定义模块代码 | Host 不会自动替它调用一次 `ctx.ask` |
-| Plugin Tool | Plugin 加载后提供 `hooks.tool` | Plugin 进程内代码 | Plugin 本身早已获得进程能力 |
-| MCP Tool | 连接 Server、缓存 `tools/list`，在外层 Loop 新一轮转换 | 本地或远程 MCP Server | schema、说明和结果属于外部输入 |
-| Skill | 模型调用内置 `skill` Tool 后加载说明 | `skill` executor | Skill 文本指导后续行动，不会因包含脚本就自动执行 |
-| Subagent | `task` 等编排 Tool 创建或恢复子 Session | 另一个 Agent Loop | 不是普通叶子函数；详见第 11 篇 |
+Permission 又只是 OpenCode 应用层的策略门。操作系统沙箱（OS Sandbox）通过低权限账户、容器、虚拟机、文件系统挂载、系统调用或网络隔离限制进程的真实能力。二者不能互换：
 
-如何安装和配置 Custom Tool、Plugin、MCP 与 Skill，不在本篇重复，参见 [05 Enhancement](./05_Enhancement.md)。
-
-## 8. Permission 不等于 OS Sandbox
-
-这是本篇最重要的安全边界。
-
-Permission 是 OpenCode 应用层中的策略门。它回答的是：
-
-> 这次受管的 Tool 调用，是否应当继续？
-
-操作系统沙箱（OS Sandbox）则通过低权限账户、容器、虚拟机、文件系统挂载、系统调用或网络隔离，回答：
-
-> 即使代码尝试越界，操作系统最多允许它做到什么？
-
-两者不能互换：
+**当前默认 OpenCode 的 Tool Permission 不会自动创建这样的 OS Sandbox。** 是否存在隔离环境，取决于 OpenCode 实际运行在哪种账户、容器、虚拟机或受限系统中。
 
 - `bash` 获准后，会以 OpenCode 进程用户的 host 权限启动真实子进程。
-- `read` 的路径边界来自路径解析和 Permission gate，不是受限文件系统挂载。
-- Custom/Plugin Tool 可以选择不调用 `ctx.ask`。
-- Plugin 模块和 factory 在模型 Tool Call 之前就可能执行代码。
+- `read` 的边界来自路径解析和 Permission gate，不是受限文件系统挂载。
+- Custom/Plugin Tool 可以选择不调用 `ctx.ask`；Plugin 模块及 factory 在模型调用前就可能执行代码。
 - 本地 MCP Server 在连接阶段已经启动；Tool Permission 主要约束后续受管的 `tools/call`。
-- 远程 MCP Server 自身的账号权限、网络和数据保留不由 OpenCode Permission 控制。
+- 远程 MCP Server 的账号权限、网络访问和数据保留不由 OpenCode Permission 控制。
 
-因此，如果实验涉及未知 Plugin、Shell 命令或外部服务，仍应使用最小权限凭据和隔离环境。Permission 对话框不能替代这些边界。
+所以，Permission 对话框不能代替最小权限凭据和隔离环境。实验未知 Plugin、Shell 命令或外部服务时，应把它们当作真实代码与真实服务审查，而不是因为入口叫 Tool 就默认安全。
 
-## 9. 失败、拒绝和取消怎样收束
+### 2.4 失败、拒绝与取消都要保存成可解释状态
 
-### 9.1 参数或执行错误
+失败与取消也要放在这个边界上理解。Permission reject 是 Harness 阻止副作用，不是模型“改变了想法”。用户取消时，OpenCode 会中断 Runner/Provider stream，并尽量把仍在 pending/running 的 Tool 标记为 interrupted error；但中断记录不会撤销已发生的外部操作。一个命令如果已经写入文件，随后才被取消，Tool Part 变为 error 也不会自动还原该文件。
 
-参数 decode 失败时，Built-in executor 不运行。文件不存在、读取失败或 MCP 返回错误时，Processor 会把调用结算为 error Tool state，使模型能够在后续轮次看到可解释的失败，而不是一直等待一个悬空调用。
+参数 decode 失败、文件不存在、读取失败或 MCP 返回错误时，Processor 会尽量形成可解释的 error Tool state，让后续模型能够观察失败并换一种行动。Permission reject 在默认配置下还会阻止当前 Loop 盲目重复同一受拒行动，兼容配置可以改变部分继续行为。无论错误来自哪一层，都不应把历史中的失败调用视作一个等待重放的副作用。
 
-### 9.2 用户拒绝
+`providerExecuted` 是需要就地说明的例外：它表示结果由 Provider 托管执行产生，OpenCode Processor 仍记录 Tool Part，却不会再运行同名本地 executor。Structured Output Tool 则是按单次请求直接加入 Tool map 的控制工具，用来捕获符合 JSON Schema 的最终对象；它不代表普通 Registry Tool 的注册、Hook 和 Permission 流程。
 
-Permission reject 会使当前调用失败。默认配置下，它还会阻止当前 Loop 继续盲目尝试相同行动；兼容配置可以改变某些继续行为。
+### 2.5 Native V2 只保留与本篇直接相关的边界
 
-拒绝不是模型“被说服了”，而是 Harness 在执行边界阻止了副作用。
+固定版本的 native V2 对 typed Tool、按 Location 物化、调用 identity、durable Tool events、Permission approval 和 Tool output store 做了更集中建模，但普通 TUI 尚未切换到这条完整路径，Custom/Plugin/MCP 等 parity 也未全部覆盖。本篇描述的仍是当前默认兼容 Runtime。无论哪条路径，受信 executor 主动请求授权、Permission 不等于 OS Sandbox 这两个原则都没有改变。
 
-### 9.3 取消和中断
+## 三、关键源码索引
 
-用户取消时，OpenCode 会中断当前 Runner/Provider stream，并尽量把仍 pending/running 的 Tool 标记为 interrupted error。下一次运行不应把这个历史调用当成尚待自动重放的副作用。
+正文已经展示理解主流程所需的控制代码。继续阅读固定源码时，可以按生命周期定位：
 
-但中断记录不能自动撤销已经发生的外部操作。例如命令已经创建了文件，随后才被取消，单靠 Tool state 变为 error 不会还原文件。
+| 主题 | 源码文件 | 关键符号 |
+| --- | --- | --- |
+| Built-in、Custom 与 Plugin 注册 | `packages/opencode/src/tool/registry.ts` | `ToolRegistry.layer`、`all`、`tools` |
+| Tool 定义与 typed decode | `packages/opencode/src/tool/tool.ts` | `Tool.define`、`wrap`、`init` |
+| 本轮物化、Hook 与执行 Context | `packages/opencode/src/session/tools.ts` | `SessionTools.resolve`、`context` |
+| 最终可见性过滤 | `packages/opencode/src/session/llm/request.ts` | `LLMRequestPrep.resolveTools` |
+| Permission 规则与等待 | `packages/opencode/src/permission/index.ts` | `evaluate`、`ask`、`reply`、`disabled` |
+| `read` 的真实 executor | `packages/opencode/src/tool/read.ts` | `ReadTool.execute`、`lines` |
+| Tool Part 状态结算 | `packages/opencode/src/session/processor.ts` | `ensureToolCall`、`handleEvent`、`completeToolCall` |
+| 下一轮模型输出转换 | `packages/opencode/src/session/message-v2.ts` | `toModelMessagesEffect` |
 
-### 9.4 `providerExecuted` 是明确例外
+完整跨章节证据与代表性测试见[源码与证据索引](./appendices/Source_Index.md)。
 
-部分 Tool 由 Provider 托管执行。此时 OpenCode 接收 Provider 产生的调用和结果，但不会再查找并执行同名本地 executor。
+## 四、总结：Harness 把概率性意图包进确定性边界
 
-它仍需要保存结果和 metadata，却不能套用“本地 Permission -> 本地 execution”的普通链路。
+一次 Tool 调用的关键不在于模型会不会生成 `read`，而在于 Harness 不把生成结果直接等同于操作事实。注册与物化决定模型可选择哪些能力，验证与 Permission 决定具体调用是否合规，executor 才接触真实环境，Settlement 再把结果变成可保存、可观察的终态。
 
-## 10. 输出边界：结果不是越完整越好
-
-工具输出会占据下一轮上下文，也可能包含敏感数据。当前默认路径有多层大小控制：
-
-- `read` 自己做分页。
-- `bash` 保留受限预览，并可能把较完整输出放入受管理文件。
-- 普通 Tool wrapper 对文本结果做通用截断。
-- MCP adapter 对返回文本和部分媒体做转换与限制。
-- 更早的 Tool output 还可能在后续 Compaction/Pruning 中失去模型可见性。
-
-这些边界并不完全统一，文本限制也不能替代附件的 MIME 和大小检查。学习者应先记住一条原则：
-
-> executor 得到的完整结果、Session 中保存的结果和下一轮模型看到的结果，可能是三个不同表示。
-
-## 11. 当前默认实现与 native V2
-
-本篇主线描述的是固定版本中普通 TUI 实际使用的兼容 Session Runtime。native V2 已引入 typed Tool、按 Location 物化、调用 identity 检查、专用 durable Tool events、持久化 `always` approval 和更集中的 Tool output store。
-
-但 native V2 尚未完整覆盖当前默认路径中的 Custom directory Tool、Plugin Tool/Hook、MCP Tool 和 StructuredOutput 等能力，普通 TUI 也未切到这条路径。因此，本篇不把 V2 的 Permission 和 Settlement 语义写成当前使用体验。
-
-另一个不会改变的原则是：V2 Permission 同样不等于 OS Sandbox；受信 leaf executor 仍需主动执行授权检查。
-
-## 12. 常见误解
-
-### 误解一：模型调用 `read`，所以模型读取了文件
-
-模型只生成 Tool Call。OpenCode 的 executor 才读取文件。
-
-### 误解二：模型能看到 `read`，说明任意文件都允许读取
-
-Tool definition 可见性与具体路径 Permission 是两层控制。
-
-### 误解三：schema 已经保证安全
-
-schema 只验证参数结构。合法的字符串路径仍可能指向不应访问的位置。
-
-### 误解四：选择 `always` 就永久写入权限配置
-
-当前默认旧路径的批准记录是 Instance 内存状态，不保证跨进程重启。
-
-### 误解五：禁止 Plugin Tool 就限制了整个 Plugin
-
-whole-tool deny 只能影响模型是否看到该 Tool，不能撤销 Plugin 模块已有的进程权限。
-
-### 误解六：Tool 返回成功，模型立刻知道结果
-
-结果还要完成 Settlement、保存和历史投影，下一 Provider Turn 才把它作为 Observation 交给模型。
-
-## 13. 本篇掌握要点
-
-读完后，应能独立说明：
-
-1. Registry、每轮 Tool materialization、Tool Call 和 execution 是四个不同阶段。
-2. 模型只看到 name、description 和 input schema，不看到本地 executor。
-3. 参数验证回答“格式是否合法”，Permission 回答“资源是否允许访问”。
-4. `allow / ask / deny` 在真实副作用之前决定是否继续。
-5. executor 返回的 raw result 还要经过 Tool Settlement，才形成 durable terminal state 和 Model Tool Output。
-6. Tool 结果通过下一轮历史投影重新进入模型上下文。
-7. Permission 是应用层策略门，不是操作系统沙箱。
-8. Plugin、Custom Tool 与 MCP 扩大能力的同时，也扩大了需要审查的信任边界。
-
-如果你能够沿着下面这条链完整复述一次 `read`，就已经掌握本篇主问题：
+只需牢牢记住这条因果链：
 
 ```text
-register
--> materialize
--> schema
--> Tool Call
--> validate
--> Permission
--> execute
--> raw result
--> settle
--> persist
--> next-turn observation
+register -> materialize -> call -> validate -> permission
+-> execute -> settle -> persist -> next-turn observation
 ```
 
-## 14. 关键源码入口
-
-以下入口均对应固定 commit `0e3474509aa5ad16afcf9c439785514d6443c6af`。正文不依赖易变化的行号。
-
-| 主题 | 文件 | 关键符号 |
-| --- | --- | --- |
-| Built-in Tool 定义与包装 | `packages/opencode/src/tool/tool.ts` | `Tool.define`、`Tool.init`、`wrap` |
-| `read` 的 schema、Permission 与执行 | `packages/opencode/src/tool/read.ts` | `ReadTool`、`Parameters`、`ReadTool.execute` |
-| Tool Registry | `packages/opencode/src/tool/registry.ts` | `ToolRegistry`、`fromPlugin`、`tools` |
-| 每轮 Tool 物化 | `packages/opencode/src/session/tools.ts` | `SessionTools.resolve` |
-| 最终可见性过滤 | `packages/opencode/src/session/llm/request.ts` | `resolveTools`、`LLMRequestPrep.prepare` |
-| Provider 调度与事件转换 | `packages/opencode/src/session/llm.ts`、`session/llm/ai-sdk.ts` | `LLM.run`、`LLMAISDK.toLLMEvents` |
-| Permission | `packages/opencode/src/permission/index.ts` | `evaluate`、`ask`、`reply` |
-| Tool 状态结算 | `packages/opencode/src/session/processor.ts` | `handleEvent`、`completeToolCall`、`failToolCall` |
-| Session History 投影 | `packages/opencode/src/session/message-v2.ts` | `toModelMessagesEffect` |
-| native V2 Tool | `packages/core/src/tool/tool.ts`、`packages/core/src/tool/registry.ts` | `Tool.make`、`materialize`、`settleWith` |
-
-下一篇将接着追问：Tool terminal state、Message 和 Part 被保存在哪里，为什么下一轮或重新打开 Session 后还能看到它们？
+正文中的关键实现可从 [Source Index 的 Tools 与 Permission](./appendices/Source_Index.md#6-tools-与-permission)继续核对，重点入口是 `tool/registry.ts`、`session/tools.ts`、`permission/`、各 Built-in executor、`session/processor.ts` 与 `session/message-v2.ts`。下一篇将沿着已经结算的 Tool Part 继续追问：OpenCode 保存了哪些状态，为什么下一轮或重新打开 Session 后还能找回它们？

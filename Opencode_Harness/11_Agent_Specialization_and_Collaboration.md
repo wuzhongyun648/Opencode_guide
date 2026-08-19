@@ -1,446 +1,468 @@
-# Agent 专业化与协作：OpenCode 如何让不同角色各司其职
+# Agent 专业化与协作：从一个模型到父子 Session
 
-上一篇：[10 Session 与 Persistence](./10_Session_and_Persistence.md)
+上一篇：[10 Session 与 Persistence](./10_Session_and_Persistence.md) ｜ 下一篇：[12 Runtime Boundary](./12_Runtime_Boundary.md)
 
-下一篇：[12 Runtime Boundary](./12_Runtime_Boundary.md)
+> 固定源码：OpenCode `0e3474509aa5ad16afcf9c439785514d6443c6af`（`dev`，2026-08-18）
+>
+> 分析主线：当前默认 TUI 使用的兼容 Session Runtime。文末单独说明 native V2 的已有能力与迁移缺口。
 
-## 1. 学习问题：为什么一个 Agent 还不够
+假设一位刚开始学习 Harness 的读者，请 OpenCode 阅读教程入口和项目规则，再整理学习顺序。材料不多时，一个主 Agent 就可以完成：它读取文件、更新 Context，最后作答。
 
-假设你刚开始学习 Harness，并向 OpenCode 提出：
-
-> 请带我从零理解这个项目里的 Harness。先找到学习入口和项目规则，再给出阅读顺序；如果范围较大，可以把资料调查交给合适的角色。
-
-模型当然可以直接回答。但 OpenCode 还可以让不同 Agent 使用不同的指令、工具和权限，或者把一个边界清晰的调查任务交给 Subagent。为什么需要这些对象？`Plan`、Todo、`task` 和 Subagent 又分别做什么？
-
-### 最短答案
-
-模型（Model）提供推理能力；代理配置（Agent）规定这次运行以什么角色、工具和权限使用模型。Plan 是一种受约束的主 Agent 工作方式，Todo 是 Session 中可观察的清单，`task` 是委派工具，Subagent 则是在独立子 Session 中工作的另一个 Agent。
-
-它们解决的是不同问题：
-
-- Agent 解决“以什么能力边界工作”；
-- Plan 解决“先调查和规划，暂不直接改动一般代码”；
-- Todo 解决“如何显式记录当前步骤”；
-- Task Tool 解决“如何发起一次委派”；
-- Subagent 解决“谁在隔离的上下文里完成被委派的子任务”。
-
-多 Agent 的价值来自专业分工和上下文隔离，而不是 Agent 数量。能由一个 Agent 清楚完成的任务，通常不必拆成多个 Agent。
-
-## 2. 最小心智模型
-
-先用下面这张图区分对象。箭头表示选择或委派关系，不表示这些对象都运行在不同进程中。
+当材料扩大到多个模块，任务会出现不同性质的工作：有人负责确定范围，有人负责搜索源码，有人负责核对结论，主线还要持续记录进度。OpenCode 为此提供了 Agent、Plan、Todo、`task` 和 Subagent 等能力。它们经常同时出现在界面或源码里，却不在同一个抽象层：
 
 ```text
-                    同一个或不同的 Model
-                              |
-                              v
-用户目标 -> 主 Agent 配置 -> 父 Session
-              |                 |
-              |                 +-> Todo：记录可见进度
-              |                 |
-              |                 +-> task Tool Call
-              |                         |
-              |                         v
-              +-> 指令 / Tools      子 Agent 配置
-                  / Permission            |
-                                          v
-                                      子 Session
-                                          |
-                                          v
-                                 task Tool Result 回到父 Session
+Model      提供生成文本和 Tool Call 的基础能力
+Agent      规定怎样使用 Model：角色、指令、权限、参数
+Plan       一种 primary Agent 工作轮廓，不是调度器
+Todo       当前 Session 的结构化进度状态
+task       父 Agent 发起委派的一次 Tool Call
+Subagent   在独立子 Session 中运行的 Agent
 ```
 
-这张图有三个关键点：
+本篇的中心不是“怎样尽可能多地启动 Agent”，而是理解 OpenCode 怎样先把一个 Model 专业化为不同工作角色，再在确有分工价值时，通过父子 Session 建立可控协作。
 
-1. Agent 和 Model 是两个维度。两个 Agent 可以使用同一个 Model，却有不同的行为边界。
-2. Todo 留在当前 Session 中描述进度；它不会自动创建子任务。
-3. Subagent 不是父 Agent 临时换了一段 Prompt，而是在新的 Session 中接收一份明确任务。
+## 一、先把六个概念放回同一张架构图
 
-第 07 篇已经解释 Agent Loop 如何持续多轮运行。本篇只关心谁以什么策略参与这个循环，以及任务怎样跨父子 Session 传递。
+### 1.1 能力、角色、状态与执行者分属四层
 
-## 3. Agent 不等于 Model
+六个概念可以先按职责归入四层：
 
-### 3.1 Model 提供推理能力
+```text
+┌───────────────────────────────────────────────────────────┐
+│ 基础能力层                                                │
+│ Model：根据 Context 生成 Text / Reasoning / Tool Call      │
+├───────────────────────────────────────────────────────────┤
+│ 工作角色层                                                │
+│ Agent：prompt + model 偏好 + permission + 参数             │
+│ ├─ build / plan：primary Agent                             │
+│ └─ general / explore：subagent                             │
+├───────────────────────────────────────────────────────────┤
+│ Session 状态层                                            │
+│ Todo：父或子 Session 各自保存的结构化清单                  │
+├───────────────────────────────────────────────────────────┤
+│ 委派执行层                                                │
+│ 父 Agent --task Tool Call--> 子 Session --Subagent Loop--> │
+│              <--------- task Tool Result ----------------- │
+└───────────────────────────────────────────────────────────┘
+```
 
-Model 接收当前上下文，生成文本或 Tool Call。它决定下一步更像“应该读取哪份教程”还是“已经可以总结”，但它本身不保存 OpenCode 的 Session，也不直接拥有文件系统权限。
+这里既有包含关系，也有执行顺序。Agent 包含一份 Model 偏好，但 Agent 不是 Model；Todo 从属于 Session，却不控制 Agent Loop；`task` 是进入委派流程的工具，而 Subagent 才是子任务的执行者。
 
-更换 Model，通常改变基础推理能力、速度、成本和工具调用表现。
+如果把它们都写成“六种 Agent 功能”，就会产生一连串错误推论：选择 Plan 不等于创建计划任务，Todo 出现不等于任务已调度，模型说“我会委派”不等于 `task` 已执行，子 Session 存在也不等于它运行在远程机器。
 
-### 3.2 Agent 定义使用模型的方式
+### 1.2 专业化解决什么问题
 
-在 OpenCode 当前默认实现中，`Agent.Info` 不只包含一段提示词，还可以包含：
+单 Agent 的优势是上下文连续、责任清楚、协调成本低。专业化与委派则主要解决三类问题：
 
-| 配置维度 | 它回答的问题 |
+- **行为边界不同**：规划角色需要限制编辑，调查角色只需读取和搜索，执行角色才需要更宽的能力。
+- **上下文需要隔离**：大范围搜索会产生大量中间文件和 Tool Result，不一定都应进入父 Session 主线。
+- **结果需要分层验收**：子 Agent 负责产出局部发现，父 Agent 仍负责核对、处理冲突并形成最终回答。
+
+因此，多 Agent 不是自动提高质量的开关。每增加一层委派，都增加任务描述、权限派生、上下文传递、等待、失败处理和结果验收成本。正确原则是使用完成目标所需的最小充分结构。
+
+## 二、Model 与 Agent：推理能力不等于工作角色
+
+### 2.1 Model 只负责本轮生成
+
+Model 接收 Harness 组装好的 Context，输出文本、推理片段或 Tool Call。它可以判断“应该读取哪份教程”，但不会因为输出了 `read(...)` 就自动访问文件系统，也不会自行保存 Session、校验路径或决定 Permission。
+
+更换 Model，通常改变基础推理能力、速度、成本、上下文窗口和工具调用表现。至于它在当前任务中扮演什么角色、能看见哪些 Tool、操作是否允许，则由 Model 外部的 Agent 与 Harness 决定。
+
+### 2.2 `Agent.Info` 是一份完整工作配置
+
+#### 2.2.1 一份 Agent 配置同时覆盖身份、能力与生成参数
+
+当前兼容 Runtime 的 `Agent.Info` 不是只有 `name` 和 system prompt。源码把角色用途、模型偏好、权限和运行参数放在同一配置中：
+
+```ts
+export const Info = Schema.Struct({
+  name: Schema.String,
+  description: Schema.optional(Schema.String),
+  mode: Schema.Literals(["subagent", "primary", "all"]),
+  native: Schema.optional(Schema.Boolean),
+  hidden: Schema.optional(Schema.Boolean),
+  color: Schema.optional(Schema.String),
+  permission: PermissionV1.Ruleset,
+  model: Schema.optional(
+    Schema.Struct({ modelID: ModelV2.ID, providerID: ProviderV2.ID }),
+  ),
+  variant: Schema.optional(Schema.String),
+  prompt: Schema.optional(Schema.String),
+  steps: Schema.optional(Schema.Finite),
+  temperature: Schema.optional(Schema.Finite),
+  topP: Schema.optional(Schema.Finite),
+  options: Schema.Record(Schema.String, Schema.Unknown),
+})
+```
+
+#### 2.2.2 配置差异把同一 Model 塑造成不同角色
+
+这份定义揭示了 Agent 的真实含义：
+
+```text
+Agent
+= 身份与用途（name / description / mode / hidden）
++ 行为指令（prompt）
++ Model 偏好（model / variant）
++ 能力边界（permission）
++ 运行参数（steps / temperature / topP / options）
+```
+
+同一个 Model 可以同时服务 `build`、`plan` 和 `explore`，但它们因指令和权限不同而形成不同角色。反过来，一个 Agent 也可以通过配置选择不同 Model。Agent 因而既不是“Model 的副本”，也不只是“给 Model 起了一个人格名称”。
+
+### 2.3 Agent 选择和 Model 选择是两次决定
+
+当前 TUI 会把选中的 `agent`、`model` 和 `variant` 一起送入 Prompt。服务端创建 User Message 时，先按显式名称选择 Agent；未指定时才使用默认可见 primary Agent。Model 则按输入、Agent 偏好、Session 当前值、最近 User Message 和 Provider 默认值逐层解析。
+
+委派时还会再做一次子 Agent 与子 Model 选择。由此可以看出：
+
+```text
+选择 Agent：决定以什么角色工作
+选择 Model：决定这个角色使用哪种推理能力
+```
+
+两者可以相关，但不能合并成一个概念。
+
+## 三、内置 Agent：primary、subagent 与 hidden 不是执行步骤
+
+### 3.1 `build` 与 `plan` 是两种 primary 工作轮廓
+
+`build` 和 `plan` 都是 primary Agent，表示它们可以直接承接当前 Session 的主任务。二者是可选择的工作模式，不是“所有任务必须先 Plan、再 Build”的固定流水线。
+
+#### 3.1.1 `build`：默认执行型主 Agent
+
+`build` 是默认可见的 primary Agent。其权限从全局默认规则开始，再允许 `question` 与 `plan_enter`，因此能够按实际 Permission 使用读取、编辑、Shell 等 Tool。
+
+“执行型”不等于所有动作无条件放行。默认规则仍把 `.env`、外部目录和 doom loop 等敏感情况放进 ask 或更具体的规则中；用户配置也可以继续覆盖、收紧或扩展权限。
+
+#### 3.1.2 `plan`：用权限和提醒形成规划边界
+
+`plan` 同样是 primary Agent，但默认拒绝一般编辑，只为 plan 文件路径保留例外，并允许 `question` 与 `plan_exit`。它还默认拒绝 `task:general`。
+
+因此 Plan 的工程含义不是“展示模型的隐藏思考”，也不是“创建一个以后自动执行的任务计划”。它是 Agent Permission、专门提醒文本和 Plan Tool 共同形成的工作轮廓：允许调查、澄清和组织方案，同时限制直接实施。
+
+这些默认规则可被用户配置合并覆盖。准确说法应当是“固定基线下 Plan 默认限制一般编辑和 general 委派”，而不是“Plan 永远不能编辑或委派”。
+
+### 3.2 `general` 与 `explore` 是可被委派的 Subagent
+
+`general` 和 `explore` 的 `mode` 是 `subagent`。它们通常不是用户主 Session 的默认承接者，而是由 `task` Tool 选中：
+
+- `general` 面向较通用的多步骤子任务，默认禁用 `todowrite`。
+- `explore` 面向文件定位、关键词搜索和代码库调查，权限集合更接近只读探索，但仍需结合具体配置判断。
+
+Subagent 这个标签说明“适合在子 Session 中使用”，并不说明它位于另一个进程、另一个主机或某种 A2A 网络。运行拓扑属于第 12 篇讨论的维度。
+
+### 3.3 hidden Agent 服务内部流程
+
+`compaction`、`title`、`summary` 等 Agent 被标记为 hidden，用于压缩、标题或摘要流程。它们说明 Agent Registry 不只是用户可切换的角色列表，也包含 Harness 内部需要的专用工作配置。
+
+所以阅读 Agent 列表时应先看 `mode` 与 `hidden`，而不是把所有名称都理解为一套要依次运行的协作团队。
+
+## 四、Plan、Todo、`task` 与 Subagent 各自负责什么
+
+### 4.1 Plan 是 Agent 工作边界，不是任务调度器
+
+选择 Plan Agent 后，主 Session 仍在运行正常 Agent Loop：Harness 组装 Context，Model 生成文本或 Tool Call，Permission 决定动作边界。Plan 没有独立的后台调度队列，也不会在方案写完后自动切到 Build 并执行。
+
+因此，“形成计划”和“执行计划”是两个不同状态。Plan 可以帮助模型明确目标、范围、约束和完成条件，但是否切换角色、是否开始实施，仍要经过显式交互或相应 Tool/Session 状态变化。
+
+### 4.2 Todo 是 Session 的结构化进度，不是 Loop 控制器
+
+#### 4.2.1 `todowrite` 替换并持久化当前 Session 的清单
+
+`todowrite` 接受一份完整数组，在 Permission 通过后替换当前 Session 的 Todo 表，并发布更新事件：
+
+```ts
+yield* ctx.ask({
+  permission: "todowrite",
+  patterns: ["*"],
+  always: ["*"],
+  metadata: {},
+})
+
+yield* todo.update({
+  sessionID: ctx.sessionID,
+  todos: params.todos,
+})
+```
+
+`Todo.update` 会在事务中删除旧清单、按位置写入新清单，随后发布 `Todo.Updated`。这使 Todo 成为 Session 级、可持久化、可观察的进度状态。
+
+#### 4.2.2 Todo 状态不会自动驱动 Agent Loop
+
+它没有做三件事：不会启动 Provider Turn，不会自动执行 pending 项，也不会决定 Agent Loop 何时停止。即使 Todo 全部 completed，Loop 仍按 Assistant finish、Tool Part、错误和中断等条件结束；即使还有 pending 项，Harness 也不会仅凭它强制模型继续。
+
+### 4.3 `task` 是委派门，Subagent 是门后的执行者
+
+#### 4.3.1 `task` 先把委派变成受控 Tool Call
+
+父模型判断某项独立调查值得拆分时，会生成 `task` Tool Call。参数中包含简短说明、给子 Agent 的任务内容、`subagent_type`，以及可选的 `task_id` 和实验性 `background`。
+
+这首先仍是一项普通意义上的 Tool Call：需要参数校验、`task:<subagent_type>` Permission、深度检查和 Tool 生命周期结算。模型在文本中说“我已经让 explore 调查”不构成委派事实，只有 `task` Tool 真正进入执行并创建或恢复子 Session，协作才开始。
+
+#### 4.3.2 Subagent 才在子 Session 中持续执行
+
+Subagent 随后以指定 Agent 配置在子 Session 中运行自己的 Agent Loop。`task` Tool 等它形成结果，再把结果结算回父 Session。两者关系可以写成：
+
+```text
+task = 委派请求与生命周期外壳
+Subagent = 子 Session 中真正持续执行工作的 Agent
+```
+
+## 五、一次前台委派的完整生命周期
+
+### 5.1 父 Agent 先决定是否值得拆分
+
+委派最适合边界清楚、能独立调查、结果可验收的子任务。例如主 Agent 正在组织 Harness 学习架构，而“只在指定源码范围内列出 Agent Registry 的关键入口”需要大量搜索，却不需要占用父 Session 的全部上下文。
+
+一个可执行的子任务契约至少应说明：
+
+- **目标**：这次调查要回答什么问题；
+- **范围**：允许查看哪些目录、文件或材料；
+- **约束**：只读、禁止外部网络、不得修改哪些对象；
+- **产物**：返回清单、结论、证据还是差异说明；
+- **完成条件**：父 Agent 依据什么判断覆盖充分。
+
+这不是用户必须套用的 Prompt 模板，而是理解父子 Context 边界的关键：新子 Session 不会自动拥有父对话，父 Agent 必须把必要信息显式写进 `params.prompt`。
+
+### 5.2 `task` 先检查实验开关、深度与 Permission
+
+#### 5.2.1 后台开关和委派深度先限制能否进入子任务
+
+`TaskTool.execute` 的前半段不是立即启动模型，而是建立控制边界：
+
+```text
+background 是否已启用
+-> 沿 parentID 计算当前委派深度
+-> 请求 task:<subagent_type> Permission
+-> 查找目标 Agent
+-> 创建或恢复子 Session
+```
+
+默认 `subagent_depth ?? 1`。根 Session 的 depth 是 0，可以创建一层子 Session；子 Agent 再尝试委派时 depth 已达到 1，因此默认被阻止。这个数限制的是父子 Session 层级，不是 Agent Loop 的 Provider Turn 数。
+
+#### 5.2.2 Permission 按 Subagent 类型求值，再查找目标 Agent
+
+Permission 检查使用 `subagent_type` 作为 pattern。这样 `plan` 可以默认拒绝 `task:general`，而用户规则又能针对具体 Subagent 类型进行覆盖。
+
+授权通过后，Task Tool 才按 `subagent_type` 查询 Agent Registry；名称不存在会进入错误结算，而不会创建一个缺少明确角色配置的子 Session。
+
+### 5.3 创建子 Session，而不是在父历史中换人格
+
+#### 5.3.1 新委派获得独立 Session identity
+
+没有可恢复的 `task_id` 时，Task Tool 创建新的 Session：
+
+```ts
+const nextSession = session ?? (yield* sessions.create({
+  parentID: ctx.sessionID,
+  title: params.description + ` (@${next.name} subagent)`,
+  agent: next.name,
+  permission: childPermission,
+}))
+```
+
+这里的 `parentID` 建立结构关系，用于树形展示和深度计算。`Session.createNext` 仍然生成新的 Session ID、时间、Agent、Permission 和独立持久化记录。父 Tool 被取消时对子任务的协调由 Task Tool 保存的 Abort/Background Job 关系完成，不能把这种执行所有权归因于 `parentID` 字段本身。
+
+#### 5.3.2 `parentID` 不会复制父 Session History
+
+关键边界是：创建代码没有复制父 Session 的 Message/Part History。子 Agent 获得的新 User Message 来自父 `task` 参数经过 `resolvePromptParts(params.prompt)` 的结果。因此 `parentID` 是关联信息，不是“继承全部上下文”的开关。
+
+#### 5.3.3 `task_id` 恢复路径不是强父子所有权句柄
+
+传入 `task_id` 时，当前实现会尝试恢复已有 Session。固定基线的取回路径没有在该位置显式验证它是否属于当前父 Session；命中已有 Session 后，也不会用这次新派生的 child Permission 重写它。因而 `task_id` 表达“尝试继续已有执行上下文”，不应被描述成经过强父子所有权校验并重新收紧策略的安全句柄。
+
+### 5.4 子 Agent 在自己的 Loop 中完成工作
+
+Task Tool 解析子任务 Prompt 后，再调用同一套 Prompt 服务：
+
+```ts
+const result = yield* ops.prompt({
+  messageID: MessageID.ascending(),
+  sessionID: nextSession.id,
+  model,
+  variant: next.model ? undefined : variant,
+  agent: next.name,
+  parts,
+})
+
+return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+```
+
+所以 Subagent 不是一次函数式“问答调用”。它拥有独立的 User Message、Assistant Message、Tool Call/Result、Permission 和 continuation，可以在子 Session 中多轮读取、搜索和整理。
+
+### 5.5 结果压缩成父 Session 的 Tool Result
+
+默认前台 `task` 会等待子任务完成。Task Tool 从子 Session 最后一个 Text Part 取得文本，包装为 `<task_result>`，并作为父 Assistant Message 中 `task` Tool Part 的 completed output。
+
+父 `SessionPrompt` 随后 continuation，重新加载父历史，下一次 Provider Turn 才看到这份 Tool Result。子 Session 的完整搜索轨迹、全部 Tool Result 和中间消息不会整体拼进父 Session：
+
+```text
+子 Session 完整历史 ──保留在子 Session
+子 Session 最终文本 ──task Tool Result──> 父 Session
+```
+
+这就是上下文隔离的实际来源，也说明父 Agent 为什么必须验收。返回的只是子 Agent 的压缩结论，不自动等于事实正确、范围完整或与主线一致。
+
+## 六、父子 Session 究竟继承什么
+
+### 6.1 Model：子配置优先，否则继承父 Assistant
+
+子 Agent 如果配置了 `next.model`，Task Tool 优先使用该 Model。否则使用发出 `task` Call 的父 Assistant Message 中的 `providerID/modelID`：
+
+```ts
+const model = next.model ?? {
+  modelID: msg.info.modelID,
+  providerID: msg.info.providerID,
+}
+```
+
+Variant 的规则更细：只有子 Model 继承自父 Assistant 时，才把父 variant 传给子 Prompt；子 Agent 显式指定 Model 时，Task Tool 把 variant 设为 `undefined`，交给子侧后续选择规则。
+
+因此，“Subagent 一定与父 Agent 使用同一 Model”和“Subagent 一定使用专用 Model”都不准确。真实优先级是子 Agent 显式 Model 优先，缺省时才继承本次父 Assistant 的 Model。
+
+### 6.2 Permission：派生硬边界，而不是复制父 Agent 角色
+
+#### 6.2.1 子 Session 只从父 Session 派生需要贯穿的规则
+
+父 Agent Permission、父 Session Permission 和子 Agent Permission 是不同来源。当前派生函数只从父 **Session** 继承 deny 与 `external_directory` 规则：
+
+```ts
+return [
+  ...parentSessionPermission.filter(
+    (rule) => rule.permission === "external_directory" || rule.action === "deny",
+  ),
+  ...(canTodo ? [] : [{ permission: "todowrite", pattern: "*", action: "deny" }]),
+  ...(canTask ? [] : [{ permission: "task", pattern: "*", action: "deny" }]),
+]
+```
+
+#### 6.2.2 有效 Permission 还要与 Subagent 自身规则合并
+
+子 Session 运行时还会结合 Subagent 自身的 Agent Permission。于是：
+
+- 父 Session 持久化 deny 和外部目录约束构成子 Session 的硬上限；
+- Subagent 自身规则决定它在这个上限内有哪些能力；
+- 父 Agent 的全部角色限制不会机械复制。
+
+这解释了 Plan 场景中的常见误解：父 Agent 的 Plan edit deny 不必然原样限制 `general` 子 Agent；真正要强制贯穿委派的限制，应写进父 Session Permission 或子 Agent policy，而不能只依赖父角色的默认轮廓。
+
+### 6.3 Context：只传显式任务，不复制父历史
+
+子 Session 能看见的直接输入主要是 `params.prompt` 解析出的 Parts，以及它自己后续产生的历史。父 Session 中用户的全部原话、已读文件、Todo 和推理过程不会自动复制。
+
+子 Agent 的 Loop 仍会按自己的 Session、Agent 和 Location 重新组装 System、环境、项目规则与 Tool definitions；这些共同来源可能与父 Session 相同，但来源是子侧重新解析，不是 `parentID` 把父 Provider Request 或父历史复制了一份。
+
+这既减少上下文污染，也带来信息损失风险。任务描述缺少路径、版本、约束或输出要求时，Subagent 不能神奇地从 `parentID` 取回这些隐含背景。
+
+### 6.4 结果：返回文本摘要，不转移最终责任
+
+前台委派把子 Session 最后文本作为 `task` output。父 Agent 应当检查：结果是否覆盖约定范围、引用路径是否存在、结论是否与已知事实冲突、是否需要补充一手证据。
+
+因此父子职责不是“父 Agent 把责任交给子 Agent”，而是：
+
+```text
+子 Agent：完成边界明确的局部调查
+父 Agent：验证局部结果并对最终回答负责
+```
+
+## 七、何时使用协作，何时保持单 Agent
+
+### 7.1 适合委派的条件
+
+以下条件同时满足得越多，委派越有价值：
+
+- 子任务能独立描述目标、范围和完成条件；
+- 需要大量搜索或阅读，中间轨迹会挤占父 Context；
+- 与父 Agent 当前工作低耦合，减少同时修改同一对象的冲突；
+- 结果可以由父 Agent 通过路径、源码或检查表独立验证；
+- 专用 Agent 的 Permission 或指令确实更适合这项工作。
+
+例如，在限定目录中建立源码入口清单、对照固定 commit 核查某个模块、按明确标准交叉审核文档，都容易形成可验收的子任务。
+
+### 7.2 不适合委派的条件
+
+以下情况通常由一个 Agent 完成更清楚：
+
+- 只需读取少量短文件；
+- 子任务强依赖当前对话的大量隐含背景；
+- 多个角色必须频繁修改同一批文件；
+- 父 Agent 无法独立验证返回结果；
+- 描述、等待和验收成本已超过直接完成成本。
+
+可以把复杂度阶梯写成：
+
+```text
+一次生成足够             -> Model 调用
+需要行动和反馈           -> 一个 Agent Loop
+需要显式进度             -> 当前 Session 加 Todo
+需要角色边界             -> 选择合适 Agent
+需要独立调查与上下文隔离 -> task + Subagent
+```
+
+后一级不是前一级的“高级版”，而是在新增约束确实存在时才引入。
+
+### 7.3 前台是默认，后台是实验能力
+
+#### 7.3.1 前台委派等待子结果并结算当前 Tool Call
+
+默认 `task` 是前台委派：父 Tool Call 等子 Session 完成，再获得 Tool Result。
+
+#### 7.3.2 后台委派先返回 running，再异步注入结果
+
+`background: true` 只有在 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` 时可用。它会先返回 running 结果，子任务结束后再向父 Session 注入 synthetic User Message 触发后续处理；父 Run 取消还会协调取消相关后台任务。
+
+后台模式改变了结果到达顺序、并发冲突和生命周期管理，应被视为实验分支，而不是理解普通 Subagent 的前置条件。
+
+## 八、current 与 native V2 的协作边界
+
+### 8.1 当前兼容 Runtime 已形成完整父子链路
+
+当前默认 TUI 使用的兼容 Runtime 中，Agent Registry、Todo、Task Tool、子 Session 创建、Model/Permission 派生、前台与实验后台结果结算都已接线。完整主线是：
+
+```text
+父 Session Agent Loop
+-> task Tool Call
+-> TaskTool 参数 / 深度 / Permission
+-> Session.createNext(parentID)
+-> 子 Session SessionPrompt.prompt
+-> 子 Agent Loop
+-> 最终 Text
+-> 父 task Tool Result
+-> 父 Loop continuation 与验收
+```
+
+### 8.2 native V2 有 Agent 与 Todo，不等于 Task/Subagent 已迁移
+
+固定源码中，native V2 已实现 Agent Registry、基础 `build`/`plan`/`general`/`explore` 配置和 Todo Tool，也有 Session `parentID` 等数据结构。但其 built-in tool parity 明确仍缺当前兼容路径的完整 `task`，Plan/Build 切换提醒与部分 Agent request/model 行为也未完全对齐。
+
+因此不能从以下任一现象推出“native V2 已支持完整多 Agent 编排”：
+
+- schema 中存在 `mode: "subagent"`；
+- Session 中存在 `parentID`；
+- native Agent Registry 能列出 general/explore；
+- native Todo 已可保存。
+
+父子 Session 编排必须同时具备委派入口、权限与深度校验、子 Prompt 执行、取消、结果结算和父 Loop continuation。固定基线下，这条完整链路仍属于当前兼容 Runtime，而不是 native V2 已完成的 parity。
+
+## 九、关键源码索引
+
+正文只保留能解释机制的短代码。继续核对时，可以从以下入口进入；更完整的文件、测试和状态说明见 [源码与证据索引](./appendices/Source_Index.md)。
+
+| 要回答的问题 | 关键入口 |
 | --- | --- |
-| `name`、`description`、`mode` | 这个角色是谁，作为主 Agent、Subagent 还是两者使用 |
-| `prompt` | 它遵循什么专门行为指令 |
-| `model`、`variant` | 它偏好哪一个 Model 和变体 |
-| `permission` | 它可以申请或使用哪些能力 |
-| `steps` | 它使用什么步骤预算提示或限制语义 |
-| `temperature`、`topP`、`options` | Provider 请求采用哪些运行参数 |
-
-因此可以得到一个更准确的公式：
-
-```text
-Agent = 角色指令 + Model 偏好 + Tool/Permission 边界 + 运行参数
-```
-
-它不是：
-
-```text
-Agent = Model
-Agent = 一段人格 Prompt
-```
-
-例如，`build` 和 `plan` 可以落到同一个 Model 上。真正让它们表现不同的，是 Agent 配置、权限规则、提醒和相关工具共同形成的边界。
-
-## 4. OpenCode 内置角色怎样分工
-
-固定源码基线下，常见内置角色可以分成三类。
-
-### 4.1 `build`：默认的执行型主 Agent
-
-`build` 是可见的 primary Agent，也是没有自定义默认配置时通常被选中的角色。它可以根据配置后的 Permission 使用读、写、Shell 等工具；某些敏感资源仍可能触发询问或拒绝。
-
-在学习场景里，适合让 `build`：
-
-- 读取本系列的 README 和教程文件；
-- 查找 `AGENTS.md` 等项目规则；
-- 解释当前 Session 中出现的 Tool Call；
-- 在用户明确要求时，创建影响范围清楚的临时学习文件。
-
-“执行型”不表示所有操作都会无条件通过。工具是否可见、是否需要确认以及最终能否执行，仍由 Permission 和 Tool Runtime 控制，详见[第 09 篇](./09_Tools_and_Permission.md)。
-
-### 4.2 `plan`：受约束的规划型主 Agent
-
-`plan` 也是 primary Agent，但默认拒绝一般编辑，只为指定的计划文件保留写入例外，并允许与规划模式切换有关的能力。它的重点是先调查、澄清和形成方案。
-
-在学习场景里，可以先让 `plan` 回答：
-
-> 为零基础学习者制定 Harness 阅读顺序。先检查 README、项目规则和章节标题，不修改教程正文。
-
-此时 `plan` 仍然可以读取信息、搜索文件并提出问题；“规划模式”并不等于 Model 停止使用工具或只输出内在思考。准确说法是：默认策略收紧了可执行范围，尤其是一般编辑。
-
-这些是固定源码下的默认轮廓。用户配置可以覆盖内置规则，所以不能把“Plan 永远不能编辑或委派”写成不受配置影响的绝对结论。
-
-### 4.3 `general` 与 `explore`：用于委派的 Subagent
-
-`general` 和 `explore` 默认属于 subagent：
-
-- `general` 面向通用、多步骤的子任务；
-- `explore` 面向文件查找、关键词搜索和代码库调查，默认能力更偏只读探索。
-
-学习 Harness 时，如果只需定位“哪些文件解释 Agent、Context 和 Tool”，`explore` 比通用执行角色更贴合任务。若子任务需要综合多份材料并形成结构化结论，`general` 更合适。
-
-OpenCode 还有 `compaction`、`title`、`summary` 等 hidden Agent，承担内部摘要或标题工作。它们说明 Agent 配置也可服务内部流程，不必都是用户可切换的“人格”。
-
-## 5. Plan、Todo、Task 与 Subagent 不是同一层概念
-
-这是本篇最容易混淆的一组名称。
-
-| 名称 | 本质 | 是否执行工作 | 是否创建新 Session |
-| --- | --- | --- | --- |
-| Plan Agent | 一份受约束的 Agent 配置与工作模式 | 可以调查和规划；默认限制一般编辑 | 否 |
-| Todo | 当前 Session 的结构化有序清单 | 否，只记录状态 | 否 |
-| `task` | 一个特殊 Tool | 发起或恢复委派 | 是，或恢复已有子 Session |
-| Subagent | 使用另一 Agent 配置的执行者 | 是，在自己的 Agent Loop 中工作 | 是 |
-
-### 5.1 Todo 是清单，不是调度器
-
-`todowrite` 接收完整 Todo 数组，更新当前 Session 的有序清单。例如：
-
-```text
-1. [in_progress] 阅读 Harness README
-2. [pending] 找到 Agent 与 Tool 的主讲章节
-3. [pending] 完成一次只读 Tool 观察
-4. [pending] 总结后续学习路线
-```
-
-Todo 的价值是把自然语言计划变成用户和系统可以观察的状态。但它不会：
-
-- 自动调用 Model；
-- 自动执行下一项；
-- 自动创建后台任务；
-- 因为还有 pending 项就强制 Agent Loop 继续；
-- 因为全部 completed 就强制 Agent Loop 停止。
-
-Todo 状态和 Loop 停止条件属于两套机制。
-
-### 5.2 Task Tool 是委派入口
-
-父模型若决定把“查找项目内全部 Harness 学习入口”交给 `explore`，生成的是一个 `task` Tool Call。它包含子任务说明、明确的 prompt、Subagent 类型，以及可选的已有 `task_id`。
-
-这仍然是一项 Tool Call：OpenCode 会检查参数、深度和 `task:<subagent_type>` Permission，再决定是否执行委派。模型说“我已委派”并不等于子 Session 已经创建。
-
-### 5.3 Subagent 是独立的问题解决者
-
-Task Tool 真正执行后，Subagent 会在独立子 Session 中运行。它有自己的：
-
-- Session ID；
-- Session History；
-- Agent 配置；
-- 有效 Permission；
-- Model 选择；
-- Agent Loop。
-
-它不是远程 A2A Agent，也不是必然位于另一个进程。这里的“独立”首先指 Session 和上下文边界。
-
-## 6. 贯穿场景：从零建立 Harness 学习地图
-
-下面只走角色协作部分，不重复第 07 篇的完整多轮循环。
-
-### 第一步：主 Agent 接收学习目标
-
-用户要求 OpenCode：
-
-> 请先阅读 Harness 目录的 README 和项目规则，告诉我主系列的学习顺序。内容很多时，先制定计划；只有在确实能减少上下文干扰时才委派调查。
-
-主 Agent 可以先读取 README 和 `AGENTS.md`。这是范围清楚、风险低的观察任务，一个 Agent 通常足够。
-
-### 第二步：用 Plan 明确边界
-
-如果目录较大，可以先在 Plan 模式形成策略：
-
-```text
-目标：建立主系列学习地图
-范围：README、06-12 的标题和章节摘要、项目规则
-暂不做：修改正文、运行外部命令、访问无关目录
-完成标准：说明推荐顺序以及每篇解决的问题
-```
-
-Plan 把调查范围变得清楚，但并不会自动把这些步骤变成后台任务。
-
-### 第三步：用 Todo 暴露进度
-
-主 Agent 可以把计划写成 Todo。用户由此看见现在在读规则，下一步准备整理章节，而不必从长段回复中猜测状态。
-
-如果材料很少，主 Agent 继续完成所有 Todo 即可。此时增加 Subagent 只会多出任务描述、上下文传递和结果汇总成本。
-
-### 第四步：只委派边界清楚的调查
-
-假设 research 目录很大，而当前目标只需要回答：
-
-> 哪些研究文件分别支撑 Agent、Context、Tool、Persistence 和 Runtime Boundary？请只返回文件清单、每份材料的一句话用途和证据范围，不修改任何文件。
-
-这是适合 `explore` 的子任务，因为：
-
-- 输入范围清楚；
-- 期望产物明确；
-- 可以只读完成；
-- 结果可以压缩后返回父 Session；
-- 子 Session 的大量搜索轨迹不必占满父 Session。
-
-### 第五步：父 Agent 验收结果
-
-Subagent 完成后，Task Tool 将结果作为父 Assistant 中的 Tool Result 结算。父 Agent 在下一轮看到的是返回结果，而不是子 Session 的全部历史。
-
-父 Agent 仍需：
-
-1. 检查结果是否覆盖任务范围；
-2. 与自己读取的 README 和项目规则交叉验证；
-3. 处理遗漏或冲突；
-4. 决定是否需要继续委派；
-5. 向用户给出统一的学习路线。
-
-委派没有把最终责任转移给 Subagent。父 Agent 仍负责组合、验证和完成用户目标。
-
-## 7. 父子 Session 如何传递任务和结果
-
-### 7.1 创建关系
-
-没有提供 `task_id` 时，当前 Task Tool 创建带 `parentID` 的子 Session。`parentID` 表示结构关系，但它不会把父 Session History 自动复制到子 Session。
-
-因此，Task prompt 必须包含完成子任务所需的信息。一个好的委派应明确写出：
-
-```text
-目标：找出 Harness 架构主系列的证据材料
-范围：Opencode_Harness/research 目录
-约束：只读，不修改文件，不访问外部网络
-产物：按模块列出文件名、一句话用途、仍需验证的边界
-完成标准：覆盖 Agent、Context、Tool、Persistence、Runtime 五类
-```
-
-只写“帮我看看”会让子 Agent 缺少范围、背景和完成标准。
-
-### 7.2 Model 与 Permission
-
-子 Agent 若配置了自己的 Model，优先使用该 Model；否则继承发出 Task Call 的父 Assistant Model。只有继承 Model 时，父 Assistant 的 Variant 才随之继承。
-
-权限也不是简单复制父 Agent：
-
-- Subagent 自己的 Agent Permission 继续生效；
-- 父 Session 持久化的 deny 和外部目录规则会参与派生子 Session Permission；
-- 父 Agent 的所有角色限制不会机械地原样复制给子 Agent。
-
-这意味着父 Agent 选择了 Plan，不等于任意 Subagent 都自然获得相同的编辑限制。真正的硬边界应落实为 Session Permission、Subagent policy 和 Tool 自身校验，而不是只依赖父 Agent 的角色名称。
-
-### 7.3 结果回传
-
-默认前台委派会等待子任务完成，取子 Session 最后的文本结果，并把它包装为父 Session 中 `task` Tool 的 output：
-
-```text
-父 Session：task call
-    |
-    v
-子 Session：独立运行并形成自己的完整历史
-    |
-    v
-子 Session 最终文本
-    |
-    v
-父 Session：task tool result
-```
-
-父模型在 continuation 后看到 Tool Result。子 Session 的读取过程、工具结果和中间消息仍保留在子 Session，不会整段拼回父上下文。
-
-这正是上下文隔离的主要收益，也是委派时必须提供完整任务契约的原因。
-
-## 8. 什么时候应该使用 Subagent
-
-可以用四个问题判断：
-
-1. 子任务能否用一句清楚的话定义目标和完成标准？
-2. 子任务是否需要独立的大量搜索或材料阅读，可能污染主上下文？
-3. 子任务是否能以一个可验证的结果返回，而不是依赖父 Session 的每个隐含细节？
-4. 分工收益是否大于任务描述、上下文传递、等待和结果验证的成本？
-
-适合委派的学习任务：
-
-- 在指定目录内查找所有项目规则；
-- 为某一个模块建立源码入口清单；
-- 对一组互不重叠的材料分别做只读调查；
-- 用明确检查表复核一篇文章的事实边界。
-
-不适合委派的任务：
-
-- 只需读取两三个短文件；
-- 强依赖当前对话里大量未显式说明的背景；
-- 子任务之间会同时修改同一批文件；
-- 结果无法由父 Agent 独立验收；
-- 只是为了显得“更 Agentic”。
-
-合理原则是：使用能够可靠完成目标的最低复杂度。
-
-```text
-单次回答足够
--> 使用一个 Model 调用
-
-需要读取、观察和多轮调整
--> 使用一个 Agent Loop
-
-需要显式进度
--> 增加 Todo
-
-需要独立专业调查或上下文隔离
--> 再增加 Task + Subagent
-```
-
-## 9. 当前实现的边界
-
-### 9.1 委派深度
-
-Task Tool 沿 `parentID` 计算深度。默认 `subagent_depth` 为 1，因此 Subagent 默认不能继续创建更深的 Subagent；配置提高后才允许嵌套。
-
-这个值限制的是委派深度，不是 Provider Turn 数，也不是 Agent Loop 的总步骤数。
-
-### 9.2 后台 Subagent
-
-前台 Task 是当前应先理解的默认路径：父调用等待子任务完成，再取得结果。
-
-`background: true` 需要显式开启 `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true`。它先返回 running 状态，子任务结束后再向父 Session 注入 synthetic User Message。这是实验能力，不应当成默认协作语义。
-
-### 9.3 native V2 的简短版本说明
-
-固定源码下，native V2 已有 Agent Registry、基础 `build`/`plan`/`general`/`explore` 配置和 Todo Tool，但尚未实现当前兼容路径完整的 Task/Subagent 父子 Session 编排。
-
-因此，本篇描述的 Task Tool、父子 Session、Model/Permission 继承和结果回传，主线都属于当前默认兼容 Runtime。完整迁移关系集中在[第 12 篇](./12_Runtime_Boundary.md)，不应因 V2 数据结构中出现 `mode: "subagent"` 或 `parentID` 就推断委派已经可用。
-
-## 10. 低风险上手观察
-
-可以在自己的学习项目中向 OpenCode 依次提出下面三类请求。示例路径需要替换为你的实际项目路径。
-
-### 观察一：单 Agent 是否已经足够
-
-```text
-请只读取当前项目的 README 和 AGENTS.md，列出 Harness 学习入口。
-不要修改文件，不运行 Shell，不委派子任务。
-```
-
-观察它是否只用读取类工具完成任务。
-
-### 观察二：Plan 与 Todo 的区别
-
-```text
-请先为“学习 Harness 主系列”制定四步计划，并用 Todo 显示进度。
-这一轮只规划和读取目录说明，不修改教程正文。
-```
-
-观察 Plan 提供的行为边界，以及 Todo 只是如何记录进度。
-
-### 观察三：一次边界清楚的委派
-
-```text
-如果 research 目录材料较多，请把“只读列出各模块研究文件及用途”
-交给适合探索的 Subagent。父 Agent 收到结果后请交叉检查，再给我最终学习地图。
-```
-
-观察父 Session 中的 `task` Tool Call、子 Session、最终 Tool Result，以及父 Agent 是否对结果进行了验收。这个练习只需读文件；如果界面提示更高权限，应先检查具体请求，不要为了完成示例一律允许。
-
-## 11. 常见误解
-
-### “更强的 Model 就不需要 Agent 配置”
-
-更强 Model 仍需要知道可见工具、权限、项目规则和职责范围。Model 能力不能替代 Harness 的确定性边界。
-
-### “Plan 是模型隐藏思考的展示”
-
-Plan 是 Agent 工作方式和权限轮廓，不是对模型私有推理过程的读取。
-
-### “写了 Todo，系统就会按顺序执行”
-
-Todo 是结构化状态。下一步是否执行仍由 Agent Loop、模型判断和 Harness 控制共同决定。
-
-### “Task Tool 本身就是 Subagent”
-
-Task Tool 是委派入口；Subagent 是在子 Session 中工作的 Agent。前者发起流程，后者执行子任务。
-
-### “子 Agent 天然继承父 Agent 的完整上下文和权限”
-
-新子 Session 不自动复制父历史，权限也按 Subagent 与 Session 规则重新组合。必要背景必须写进 Task prompt。
-
-### “多 Agent 一定更快、更可靠”
-
-每次拆分都会增加上下文传递、结果汇总、权限和错误传播边界。只有分工或隔离收益更大时才值得拆分。
-
-## 12. 本篇掌握要点
-
-读完本篇，应能解释：
-
-1. Model 负责推理，Agent 定义怎样使用 Model；二者不能互换。
-2. `build` 与 `plan` 的主要差异来自指令、工具和 Permission 边界，不是不同的“模型人格”。
-3. Todo 记录当前 Session 的进度，不执行工作，也不控制 Agent Loop 停止。
-4. `task` 是委派 Tool，Subagent 是独立子 Session 中的执行者。
-5. 新子 Session 不自动复制父历史；Task prompt 必须包含目标、范围、约束、产物和完成标准。
-6. Subagent 结果以 Tool Result 回到父 Session，父 Agent 仍负责验证和汇总。
-7. 默认委派深度有限，后台模式是实验能力，native V2 的 Task/Subagent parity 尚未完成。
-8. Agent 设计应选择能可靠完成目标的最低复杂度。
-
-## 13. 关键源码入口
-
-本文结论以 OpenCode 固定 commit `0e3474509aa5ad16afcf9c439785514d6443c6af` 为基线。行号可能随版本变化，优先按导出符号查找。
-
-| 主题 | 文件 | 关键符号 |
-| --- | --- | --- |
-| Agent 数据与内置角色 | `packages/opencode/src/agent/agent.ts` | `Agent.Info`、Agent layer、`defaultInfo` |
-| Plan 提醒与切换 | `packages/opencode/src/session/reminders.ts`、`packages/opencode/src/tool/plan.ts` | `SessionReminders.apply`、`PlanExitTool` |
-| Todo Tool 与存储 | `packages/opencode/src/tool/todo.ts`、`packages/opencode/src/session/todo.ts` | `TodoWriteTool`、`Todo.update`、`Todo.get` |
-| Task 与子 Session | `packages/opencode/src/tool/task.ts` | `TaskTool`、`TaskTool.execute`、`TaskTool.runTask` |
-| 子 Session 权限派生 | `packages/opencode/src/agent/subagent-permissions.ts` | `deriveSubagentSessionPermission` |
-| 父子 Session 创建 | `packages/opencode/src/session/session.ts` | `Session.createNext` |
-| Agent 默认行为测试 | `packages/opencode/test/agent/agent.test.ts` | build、plan、默认 Agent 与权限测试 |
-| Task 行为测试 | `packages/opencode/test/tool/task.test.ts` | 创建、恢复、深度和取消测试 |
-| 父子权限边界测试 | `packages/opencode/test/agent/plan-mode-subagent-bypass.test.ts` | Subagent policy 与父 Session deny 测试 |
-| native V2 Agent/Todo | `packages/core/src/agent.ts`、`packages/core/src/plugin/agent.ts`、`packages/core/src/tool/todowrite.ts` | `AgentV2.select`、内置 Agent、`todowrite` |
-| native V2 Task 缺口 | `packages/core/src/tool/builtins.ts`、`specs/v2/todo.md` | remaining Tool port、Subagent/BackgroundJob 规划 |
-
-下一篇将把这些逻辑角色放回实际运行环境，解释 TUI、Worker、Server、Provider、Tool Runtime 与事件通道分别位于哪里。
+| Agent 配置包含什么 | `packages/opencode/src/agent/agent.ts`：`Agent.Info` |
+| build、plan、general、explore 如何定义 | `packages/opencode/src/agent/agent.ts`：内置 Agent 初始化 |
+| Plan 的提醒与切换如何形成 | `packages/opencode/src/session/reminders.ts`、`packages/opencode/src/tool/plan.ts` |
+| Todo 如何写入 Session | `packages/opencode/src/tool/todo.ts`、`packages/opencode/src/session/todo.ts` |
+| Task 参数、深度、子 Session、Model 与结果 | `packages/opencode/src/tool/task.ts`：`TaskTool.execute`、`TaskTool.runTask` |
+| 子 Session Permission 怎样派生 | `packages/opencode/src/agent/subagent-permissions.ts`：`deriveSubagentSessionPermission` |
+| `parentID` 保存在哪里 | `packages/opencode/src/session/session.ts`：`Session.createNext` |
+| 子 Agent 有效 Tool 怎样解析 | `packages/opencode/src/session/tools.ts`：`SessionTools.resolve` |
+| native V2 Agent 与 built-in tool 边界 | `packages/core/src/agent.ts`、`packages/core/src/plugin/agent.ts`、`packages/core/src/tool/builtins.ts` |
+
+## 十、总结：专业化是配置，协作是受控的父子 Session
+
+OpenCode 的多 Agent 结构可以归结为一条清晰因果链：Model 提供生成能力；Agent 用指令、Model 偏好、Permission 和运行参数把能力塑造成角色；Plan 是一种 primary 角色边界；Todo 保存当前 Session 的可见进度；父模型通过 `task` Tool 提出委派；Task Tool 在深度和 Permission 边界内创建子 Session；Subagent 在自己的 Agent Loop 中工作；最终文本作为 Tool Result 回到父 Session，由父 Agent 验收并整合。
+
+理解这条链后，就不会再把“选择 Plan”“写 Todo”“调用 task”和“启动 Subagent”当成同一件事，也不会把子 Session 的逻辑独立误认为远程部署。下一篇将继续沿后一个问题展开：TUI、Worker、Server、Provider、Tool 与事件通道实际跨过哪些逻辑、进程和网络边界。
