@@ -1,6 +1,6 @@
 # OpenCode 扩展能力：Skill、MCP 与 Plugin
 
-> 本文介绍 Skill、MCP 和 Plugin 的工作原理，并分别完成一次查找、安装、使用、验证和卸载。开始前应已经完成 [01_Installation.md](./01_Installation.md)、[02_Model_Deployment.md](./02_Model_Deployment.md) 中的基础配置。
+> 本文介绍 Skill、MCP 和 Plugin 的工作原理，并分别完成一次查找、安装、使用、验证和卸载。开始前应已经完成 [01_Installation.md](../OpenCode_Tutorial/01_Installation.md)、[02_Model_Deployment.md](../OpenCode_Tutorial/02_Model_Deployment.md) 中的基础配置。
 >
 > Skill、MCP Server 和 Plugin 可能来自第三方。安装前必须检查来源、代码、权限和数据流向。本文提到的社区扩展不是 OpenCode 官方安全背书，版本和服务条款也可能变化。
 
