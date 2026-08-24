@@ -101,7 +101,7 @@ keep_awake.ps1
 然后把里面原来的内容全部删掉，复制下面这段进去：
 
 ```powershell
-Add-Type @"
+Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 
@@ -110,26 +110,25 @@ public class MouseJiggler
     [DllImport("user32.dll")]
     public static extern void mouse_event(
         uint dwFlags,
-        uint dx,
-        uint dy,
+        int dx,
+        int dy,
         uint dwData,
         UIntPtr dwExtraInfo
     );
 
     public const uint MOUSEEVENTF_MOVE = 0x0001;
 }
-"@
+'@
 
-Write-Host "Keep Awake 已启动"
-Write-Host "每 30 秒模拟一次鼠标移动"
-Write-Host "按 Ctrl+C 即可停止"
+Write-Host "Keep Awake started."
+Write-Host "Mouse will move slightly every 30 seconds."
+Write-Host "Press Ctrl+C to stop."
 Write-Host ""
 
 $direction = 1
 
 try {
     while ($true) {
-
         [MouseJiggler]::mouse_event(
             [MouseJiggler]::MOUSEEVENTF_MOVE,
             $direction,
@@ -144,7 +143,7 @@ try {
     }
 }
 finally {
-    Write-Host "Keep Awake 已停止"
+    Write-Host "Keep Awake stopped."
 }
 ```
 
