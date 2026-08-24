@@ -163,12 +163,18 @@ definition 的文字也会影响模型行为。名称告诉模型调用哪个入
 
 ### 1.3 Tool Call：结构化意图还不是行动事实
 
-模型可能输出下面这种说明性调用：
+#### 1.3.1 API 响应不只有文本
+
+初学者很容易产生一个疑问：模型 API 不是只能返回文本吗，OpenCode 又怎样从文本里识别“调用 `read`”的意图？这里首先要区分网页最终展示的答案与 API 的响应结构。HTTP API 返回的是一个 JSON 或流式事件序列；普通文本只是其中一种带类型的内容，Tool Call 也可以是另一种带类型的内容。
+
+OpenCode 发起 Provider Request 时，除了 Messages，还会发送本轮 Tool definitions。Provider 因而知道可以生成哪些工具名，以及每个工具的参数必须满足什么 schema。模型可能选择生成普通文本，也可能选择生成一个 Tool Call。把不同 Provider 的字段差异暂时隐藏后，一次调用可以说明性地写成：
 
 ```json
 {
-  "tool": "read",
-  "arguments": {
+  "type": "tool-call",
+  "callID": "call_123",
+  "toolName": "read",
+  "input": {
     "filePath": "Opencode_Harness/README.md",
     "offset": 1,
     "limit": 200
@@ -176,7 +182,55 @@ definition 的文字也会影响模型行为。名称告诉模型调用哪个入
 }
 ```
 
-不同 Provider 的线上协议可能不同，OpenCode 会把流式响应归一化成内部事件。到这里为止，教程文件仍未被 `read` executor 读取。
+这不是模型写给用户看的一段 JSON 文本，而是响应包中的一种结构化输出。OpenAI Responses 协议可能使用 `function_call`，Anthropic 协议可能使用 `tool_use`；网页和上层 SDK 通常只展示或提取最终文本，所以使用者平时可能看不到这些控制事件。只有请求中提供了 Tool definitions，模型才拥有按正式 Tool Calling 协议选择这些能力的条件。
+
+#### 1.3.2 OpenCode 读取协议事件，不从自然语言里猜
+
+不能把这一步理解成：模型先输出“我想读取文件”，Provider 或 OpenCode 再用正则表达式猜出工具意图。对支持原生 Tool Calling 的 Provider 来说，到公开 API 边界时，调用已经具有明确的类型、工具名、调用 ID 和参数。至于 Provider 内部究竟使用特殊 token、约束解码还是其他机制把模型生成结果组织成这些字段，各家实现并未完全公开；Harness 依赖的是公开协议合同，而不是某种假定的内部实现。
+
+当前默认 OpenCode 路径还要经过两层协议适配：Provider adapter 先把各家不同的线上协议转换成 AI SDK 的 `fullStream` 事件，`LLMAISDK.toLLMEvents` 再把它们归一化成 OpenCode 自己的 `LLMEvent`。
+
+```text
+Provider 原始流
+OpenAI function_call / Anthropic tool_use / 其他协议
+        ↓ Provider adapter
+AI SDK fullStream
+tool-input-start / tool-input-delta / tool-input-end / tool-call
+        ↓ LLMAISDK.toLLMEvents
+OpenCode LLMEvent
+        ↓ SessionProcessor
+Tool Part：pending -> running
+```
+
+参数又常常是流式到达的。适配器可能先收到工具名和调用 ID，再收到若干段参数增量，最后取得完整对象。`SessionProcessor` 处理 `tool-input-*` 时建立 pending Tool Part，处理最终 `tool-call` 时才把完整输入写入并转为 running。即使界面已经显示“正在调用 read”，到这里也只表示 Harness 收到了结构化行动请求；教程文件仍未被 `read` executor 读取。
+
+#### 1.3.3 一次工具使用通常跨过两个 Provider Turn
+
+仓库中的真实 Provider 录制 `packages/opencode/test/fixtures/recordings/session/native-zen-tool-loop.json` 展示了协议层的完整往返。它使用 `get_weather` 作为最小工具，轨迹可以压缩为：
+
+```text
+Provider Turn 1 请求
+Messages + get_weather definition
+        ↓
+response.output_item.added
+item.type = function_call, name = get_weather
+        ↓
+response.function_call_arguments.delta × 多次
+        ↓
+response.function_call_arguments.done
+arguments = {"city":"Paris"}
+        ↓
+Harness 执行工具
+result = {"temperature":22,"condition":"sunny"}
+        ↓
+Provider Turn 2 请求
+原历史 + function_call + function_call_output
+        ↓
+response.output_text.done
+"Paris is sunny."
+```
+
+这份录制使用 native Provider adapter 展示原始协议形状；当前默认 TUI 由 AI SDK adapter 负责相同的 Provider 差异归一化。两条实现路径的共同因果关系没有变化：第一次 Provider Turn 只提出调用，Harness 在模型之外执行并结算工具，第二次 Provider Turn 才利用 Tool Result 继续生成文本或下一次调用。
 
 这是模型与 Harness 的责任分界：模型用概率性判断决定是否调用、调用哪个 Tool、先读取哪个文件；Harness 不把这份输出当成可信指令，而是把它当作等待验证的数据。
 
@@ -445,6 +499,7 @@ Permission 又只是 OpenCode 应用层的策略门。操作系统沙箱（OS Sa
 | Tool 定义与 typed decode | `packages/opencode/src/tool/tool.ts` | `Tool.define`、`wrap`、`init` |
 | 本轮物化、Hook 与执行 Context | `packages/opencode/src/session/tools.ts` | `SessionTools.resolve`、`context` |
 | 最终可见性过滤 | `packages/opencode/src/session/llm/request.ts` | `LLMRequestPrep.resolveTools` |
+| Provider 请求与事件归一化 | `packages/opencode/src/session/llm.ts`、`packages/opencode/src/session/llm/ai-sdk.ts` | `streamText`、`fullStream`、`toLLMEvents` |
 | Permission 规则与等待 | `packages/opencode/src/permission/index.ts` | `evaluate`、`ask`、`reply`、`disabled` |
 | `read` 的真实 executor | `packages/opencode/src/tool/read.ts` | `ReadTool.execute`、`lines` |
 | Tool Part 状态结算 | `packages/opencode/src/session/processor.ts` | `ensureToolCall`、`handleEvent`、`completeToolCall` |
